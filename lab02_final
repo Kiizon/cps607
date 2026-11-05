@@ -1,5 +1,3 @@
-// FULL ROBOT: turn until something is within 27.5 cm -> drive straight at it -> color -> push/reject
-
 // pins
 const int A_pinF = 6;     // motor A = RIGHT wheel
 const int A_pinR = 5;
@@ -28,7 +26,7 @@ const float detect_range = 0.40; // m, turn until something is this close or clo
 
 // Approach
 const int approach_speed = 110;
-const float stop_dist = 0.10;  // m, MEASURE THIS: ultrasonic reading when IR sensors are ~4 cm from the box
+const float stop_dist = 0.10;  // m
 const long max_approach_time = 4000; // ms, give up if the box is never reached
 
 // Color check
@@ -57,7 +55,7 @@ unsigned long currentMillis = 0;
 unsigned long previousMillis = 0;
 const long interval = 60;
 
-float front_distance = 4.0;   // m, raw reading
+float front_distance = 4.0; // Ultrasonic: raw reading. A moving average lagged while turning; no echo returns 4.0 m instead of 0 to avoid false detections
 
 const int ir_window_size = 5;
 int ir_window_R[ir_window_size];
