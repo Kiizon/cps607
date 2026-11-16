@@ -13,12 +13,12 @@ const int B_pinR = 10;
 // Both positive -> steer right. Signs are flipped vs the class equation's minus signs by STEER_SIGN.
 float Kp_H = 0.5;          // PWM per degree of heading error
 float Ki_H = 0.0;         // PWM per (degree * s)   start at 0
-float Kp_L = 0.5;         // PWM per mm of lateral error
-float Ki_L = 0.03;        // PWM per (mm * s)
+float Kp_L = 0.8;         // PWM per mm of lateral error
+float Ki_L = 0.05;        // PWM per (mm * s)
 const float I_MAX_H = 200; // degree*s, integral clamp (anti-windup)
 const float I_MAX_L = 500; // mm*s, integral clamp (anti-windup)
 const float MAX_STEER = 40;      // PWM, max difference applied to each wheel
-int left_trim = 8;         // PWM subtracted from the LEFT wheel to drive straight. Negative = speed the left wheel up. Tune with m<n>.
+int left_trim = -4;         // PWM subtracted from the LEFT wheel to drive straight. Negative = speed the left wheel up. Tune with m<n>.
 float max_approach_deg = 20;  // lateral error can never ask for more than this approach angle toward/away from the wall
 int base_speed = 110;      // PWM, forward speed (keep base +/- MAX_STEER above your minimum PWM)
 const int STEER_SIGN = 1;  // flip to -1 if the robot steers away from the wall instead of toward it
@@ -29,9 +29,9 @@ bool guard_active = false;   // true when a side sensor had no echo and PID was 
 unsigned long last_pid_ms = 0;
 
 // Corner turning (no encoders/gyro, so turns are timed)
-float front_stop_dist = 0.13;   // m, wall straight ahead this close -> turn
-int turn_speed = 130;           // PWM for turning on the spot (above your minimum PWM)
-long turn_90_ms = 675;         // ms for ~90 deg at turn_speed. TUNE THIS on the floor.
+float front_stop_dist = 0.16;   // m, wall straight ahead this close -> turn
+int turn_speed = 200;           // PWM for turning on the spot (above your minimum PWM)
+long turn_90_ms = 475;         // ms for ~90 deg at turn_speed. TUNE THIS on the floor.
 
 // State machine
 enum State {
@@ -41,7 +41,19 @@ enum State {
 };
 State state = FOLLOW_WALL;
 
-const int SENSOR_GAP_MS = 30;  // ms between pinging different sensors
+const int SENSOR_GAP_MS = 10;  // ms between pinging different sensors (an echo from <1 m is back in 6 ms)
+const unsigned long ECHO_TIMEOUT_US = 6000;  // wait at most 6 ms for an echo = ~1 m range (was 30 ms = 5 m).
+                                             // A sensor that hears nothing costs this long every loop.
+
+// Kickstart: when the wheels start from rest, a short full-power pulse gets them past static friction;
+// the caller then drops to its real speed. Used for all forward driving, NOT for standing turns.
+const int KICK_PWM = 255;
+int KICK_MS = 60;              // ms of full power (0 = off). Tune with k<ms>.
+bool motors_running = false;   // false after stopMove(); the next steer() kickstarts
+
+// Timing (printed so you can check sensing -> action delay)
+unsigned long last_act_ms = 0;     // when the last motor command was written
+unsigned long prev_loop_ms = 0;
 unsigned long state_start = 0;
 
 // median-of-3 filter on each ultrasonic sensor (rejects single bad readings and timeouts)
@@ -62,7 +74,7 @@ const int aheadEchoPin = 13;
 void setup() {
   Serial.begin(9600);
   Serial.setTimeout(50);
-  Serial.println("Tune: h<Kp_H> j<Ki_H> p<Kp_L> i<Ki_L> s<base speed> m<left trim> a<max approach deg> w<wall dist mm> t<turn ms> f<front stop cm>, e.g. p0.3  (send with newline)");
+  Serial.println("Tune: h<Kp_H> j<Ki_H> p<Kp_L> i<Ki_L> s<base speed> m<left trim> a<max approach deg> w<wall dist mm> t<turn ms> f<front stop cm> k<kick ms>, e.g. p0.3  (send with newline)");
 
   pinMode(latBackTrigPin, OUTPUT);
   pinMode(latBackEchoPin, INPUT);
@@ -85,6 +97,7 @@ void setup() {
     primeFilters();
   }
   last_pid_ms = millis();
+  prev_loop_ms = millis();
   setState(FOLLOW_WALL);
 }
 
@@ -92,11 +105,15 @@ void loop() {
   handleSerialTuning();
 
   // ---------- SENSORS (one at a time, spaced so pings don't interfere) ----------
+  unsigned long t_loop = millis();
+  // The forward sensor goes first: it only feeds the left-turn trigger, so a slightly older reading is fine.
+  // The two side sensors go last so the steering command is built from the freshest data.
+  float raw_ahead = readAheadSensorData();
+  delay(SENSOR_GAP_MS);
+  unsigned long t_sense = millis();          // start of the side-sensor readings the steering uses
   float raw_back = readLateralBackSensorData();
   delay(SENSOR_GAP_MS);
   float raw_front = readLateralFrontSensorData();
-  delay(SENSOR_GAP_MS);
-  float raw_ahead = readAheadSensorData();
 
   hist_back[hist_idx] = raw_back;
   hist_front[hist_idx] = raw_front;
@@ -138,7 +155,18 @@ void loop() {
   Serial.print(" Steer:");
   Serial.print(steer_cmd);
   Serial.print(" NoEcho:");
-  Serial.println(guard_active ? 1 : 0);
+  Serial.print(guard_active ? 1 : 0);
+
+  // sensing -> action: first side ping to the motor command being written
+  unsigned long act = (last_act_ms >= t_sense) ? last_act_ms : millis();
+  unsigned long sense_to_act = act - t_sense;
+  Serial.print(" SenseToAct_ms:");
+  Serial.print(sense_to_act);
+  Serial.print(" Loop_ms:");
+  Serial.print(t_loop - prev_loop_ms);
+  if (sense_to_act > 50) Serial.print("  <-- SENSE TO ACT OVER 50 ms");
+  Serial.println();
+  prev_loop_ms = t_loop;
 }
 
 
@@ -275,7 +303,7 @@ float readSensor(int trigPin, int echoPin) {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  float time = pulseIn(echoPin, HIGH, 30000) * 1e-6;
+  float time = pulseIn(echoPin, HIGH, ECHO_TIMEOUT_US) * 1e-6;
   if (time == 0) return 4.0;     // no echo = nothing there
   return time * 343 * 0.5;       // meters
 }
@@ -303,8 +331,9 @@ void handleSerialTuning() {
     case 'w': desired_wall_dist = v; break;
     case 't': turn_90_ms = (long)v; break;
     case 'f': front_stop_dist = v / 100.0; break;   // cm -> m
+    case 'k': KICK_MS = (int)v; break;
     default:
-      Serial.println("Unknown command. Use h j p i s m w t f a.");
+      Serial.println("Unknown command. Use h j p i s m w t f a k.");
       return;
   }
   integral_H = 0;   // restart the integrals after any change
@@ -319,7 +348,8 @@ void handleSerialTuning() {
   Serial.print(" maxApproach="); Serial.print(max_approach_deg);
   Serial.print(" wall="); Serial.print(desired_wall_dist);
   Serial.print(" turn_ms="); Serial.print(turn_90_ms);
-  Serial.print(" front_stop_cm="); Serial.println(front_stop_dist * 100);
+  Serial.print(" front_stop_cm="); Serial.print(front_stop_dist * 100);
+  Serial.print(" kick_ms="); Serial.println(KICK_MS);
 }
 
 // Class-form controller. Returns steering PWM, + = turn right.
@@ -345,14 +375,30 @@ float pid_steer(float lat_err, float heading_deg, float dt) {
 
 // Drive both wheels forward at separate speeds: right wheel (A), left wheel (B)
 void steer(float speedRight, float speedLeft) {
+  last_act_ms = millis();
+  if (!motors_running) {         // starting from rest: kickstart first
+    kickstart();
+    motors_running = true;
+  }
   analogWrite(A_pinF, constrain((int)speedRight, 0, 255));
   analogWrite(A_pinR, 0);
   analogWrite(B_pinF, constrain((int)speedLeft - left_trim, 0, 255));   // left_trim evens out the two motors
   analogWrite(B_pinR, 0);
 }
 
-// Spin left on the spot: right wheel forward, left wheel backward
+// Short full-power pulse on both wheels to break static friction. steer() then sets the real speeds.
+void kickstart() {
+  if (KICK_MS <= 0) return;
+  analogWrite(A_pinF, KICK_PWM);
+  analogWrite(A_pinR, 0);
+  analogWrite(B_pinF, KICK_PWM);
+  analogWrite(B_pinR, 0);
+  delay(KICK_MS);
+}
+
+// Spin left on the spot: right wheel forward, left wheel backward (no kickstart for standing turns)
 void turnLeft(int s) {
+  last_act_ms = millis();
   analogWrite(A_pinF, s);
   analogWrite(A_pinR, 0);
   analogWrite(B_pinF, 0);
@@ -360,6 +406,7 @@ void turnLeft(int s) {
 }
 
 void stopMove() {
+  motors_running = false;
   analogWrite(A_pinF, 0);
   analogWrite(A_pinR, 0);
   analogWrite(B_pinF, 0);
