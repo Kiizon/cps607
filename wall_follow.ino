@@ -60,7 +60,6 @@ const float AHEAD_TRUST_MM = 1200;            // forward readings past this are 
 const unsigned long PING_GAP_MS = 25;         // one sensor per 25 ms so echoes never overlap
 const unsigned long ECHO_TIMEOUT_US = 15000;  // ~2.5 m
 const float SEEK_STOP_MM = 300;               // SEEK_WALL stops here and squares up
-const float SCAN_MATCH_MM = 30;               // "back on the shortest reading" tolerance
 const unsigned long SEEK_TIMEOUT_MS = 8000;
 const unsigned long READ_TIMEOUT_MS = 5000;
 const unsigned long BACKOFF_TIMEOUT_MS = 4000;
@@ -87,8 +86,8 @@ int left_done_deg = 5;         // d  TURN_LEFT ends within this many degrees of 
 int exit_straight_ms = 150;    // b  LEFT_EXIT straight time
 int slow_pwm = 90;             // v  approach, back-off and slowest follow speed, keep above stall
 int read_mm = 50;              // r  forward range where the wall colour is read
-int scan_steps = 26;           // l  scan steps, should add up to a bit more than one full turn
-int scan_step_ms = 60;         // j  spin time for one scan step (~15 deg)
+int scan_turn_ms = 2000;       // l  time for one full turn at scan_pwm, measure
+int scan_pwm = 120;            // j  scan spin speed, slower = finer aim, keep above stall
 int sq_step_ms = 40;           // k  spin time for one square-up step (~5 deg)
 int star_window_mm = 50;       // f  look for the floor star this far either side of the expected spot, 0 = off
 int hold_ms = 3200;            // z  stop at each waypoint (3 s required + margin)
@@ -283,23 +282,36 @@ void loop() {
 
 
 // LOCALIZATION LOGIC: find the nearest wall, then name the wall from two colour readings
-// the shortest range to a flat wall is straight at it, so: one full turn remembering the
-// shortest reading, then keep turning until we're back on it. no step angles needed.
+// the shortest range to a flat wall is straight at it. spin one full turn without stopping,
+// pinging the whole way, and note when the shortest reading came. then spin back to that
+// moment the short way round. SEEK_WALL squares up exactly once it's close.
 void faceNearestWall() {
   echo_phase = IDLE;   // drop any half-finished non-blocking ping
+  float r0 = NO_ECHO, r1 = NO_ECHO, r2 = NO_ECHO;
+  unsigned long t0 = 0, t1 = 0;
+  float best = NO_ECHO;
+  unsigned long best_ms = 0;
+  unsigned long start = millis();
+  spinRight(scan_pwm);
+  while (millis() - start < (unsigned long)scan_turn_ms) {
+    r2 = r1; r1 = r0; t1 = t0;
+    t0 = millis() - start;
+    r0 = pingBlocking(AHEAD);
+    float m = median3(r0, r1, r2);              // one stray echo can't fake the nearest wall
+    if (m < best) { best = m; best_ms = t1; }   // the median is centred on the middle ping
+    delay(PING_GAP_MS);
+  }
   stopMotors();
   delay(150);
-  float best = NO_ECHO;
-  for (int i = 0; i < scan_steps; i++) {
-    best = min(best, aheadMedian5());
-    spinStep(1, scan_step_ms);
-  }
-  float r = aheadMedian5();
-  for (int i = 0; i < scan_steps && best < NO_ECHO && r > best + SCAN_MATCH_MM; i++) {
-    spinStep(1, scan_step_ms);
-    r = aheadMedian5();
-  }
-  resyncAhead(r);
+
+  // a full turn put us back where we started: the shortest reading is best_ms ahead,
+  // or scan_turn_ms - best_ms behind, whichever is shorter
+  if (best_ms <= (unsigned long)scan_turn_ms / 2) spinRight(scan_pwm);
+  else { spinLeft(scan_pwm); best_ms = scan_turn_ms - best_ms; }
+  delay(best_ms);
+  stopMotors();
+  delay(150);
+  resyncAhead(aheadMedian5());
 }
 
 // turn until the forward range stops getting shorter, i.e. facing the wall square
@@ -745,7 +757,7 @@ void printSettings() {
   Serial.print(" e="); Serial.print(ahead_clear_mm); Serial.print(" d="); Serial.print(left_done_deg);
   Serial.print(" b="); Serial.print(exit_straight_ms); Serial.print(" v="); Serial.print(slow_pwm);
   Serial.print(" r="); Serial.print(read_mm);
-  Serial.print(" l="); Serial.print(scan_steps); Serial.print(" j="); Serial.print(scan_step_ms);
+  Serial.print(" l="); Serial.print(scan_turn_ms); Serial.print(" j="); Serial.print(scan_pwm);
   Serial.print(" k="); Serial.print(sq_step_ms); Serial.print(" f="); Serial.print(star_window_mm);
   Serial.print(" z="); Serial.print(hold_ms);    Serial.print(" o="); Serial.print(slow_zone_mm);
   Serial.print(" y="); Serial.print(mm_per_s);   Serial.print(" q="); Serial.print(use_median);
@@ -789,8 +801,8 @@ void applyCommand(char c, float v) {
     case 'b': exit_straight_ms = (int)v; break;
     case 'v': slow_pwm = (int)v; break;
     case 'r': read_mm = (int)v; break;
-    case 'l': scan_steps = (int)v; break;
-    case 'j': scan_step_ms = (int)v; break;
+    case 'l': scan_turn_ms = (int)v; break;
+    case 'j': scan_pwm = (int)v; break;
     case 'k': sq_step_ms = (int)v; break;
     case 'f': star_window_mm = max((int)v, 0); break;
     case 'z': hold_ms = (int)v; break;
