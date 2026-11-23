@@ -158,9 +158,14 @@ void setup() {
   if (LED_PIN >= 0) pinMode(LED_PIN, OUTPUT);
   stopMotors();
 
-  Serial.print("mode "); Serial.println(MODE);
+  const char* const MODE_NAME[5] = {"sensors only, motors off", "drive straight",
+    "follow the 250 mm ring forever", "localize, then stop", "full run: localize, then visit BR, TR, L"};
+  Serial.print("MODE "); Serial.print(MODE); Serial.print(": "); Serial.println(MODE_NAME[MODE]);
   Serial.println("tune: w p h i a s x m u n t e d b v r l j k f z o y q F S L, g prints all");
-  if (MODE >= 1) delay(3000);   // time to put the robot down
+  if (MODE >= 1) {
+    Serial.println("starting in 3 s, put the robot down");
+    delay(3000);
+  }
   setState(SCAN);
 }
 
@@ -171,8 +176,8 @@ void loop() {
   updateSensors();
   updateLine();
 
-  if (MODE == 0) { printEvery200ms(); return; }
-  if (MODE == 1) { driveStraightAt(base); printEvery200ms(); return; }
+  if (MODE == 0) { printStatusEvery500ms(); return; }
+  if (MODE == 1) { driveStraightAt(base); printStatusEvery500ms(); return; }
 
   if (sides_fresh) {
     sides_fresh = false;
@@ -213,10 +218,12 @@ void loop() {
       driveStraightAt(base);
       if (dist[AHEAD] <= SEEK_STOP_MM) {
         stopMotors();
+        event("SEEK_WALL"); Serial.print("found a wall "); printMm(dist[AHEAD]); Serial.println(" ahead, squaring up to it");
         squareUp();
         setState(MODE >= 3 ? APPROACH_READ : BACK_OFF);
       } else if (elapsed > SEEK_TIMEOUT_MS) {
         // likely aimed into a corner where the echo glances off, turn a bit and retry
+        event("SEEK_WALL"); Serial.println("no wall after 8 s, turning a bit and trying again");
         spinRight(turn_pwm); delay(250); stopMotors();
         setState(SEEK_WALL);
       }
@@ -228,7 +235,9 @@ void loop() {
       if (dist[AHEAD] <= read_mm || elapsed > READ_TIMEOUT_MS) {
         stopMotors();
         delay(250);   // let it stop rocking
-        colours[reads_done++] = readColour();
+        if (dist[AHEAD] > read_mm) { event("APPROACH_READ"); Serial.println("timed out before reaching the wall, reading anyway"); }
+        colours[reads_done] = readColour(reads_done + 1);
+        reads_done++;
         setState(BACK_OFF);
       }
       break;
@@ -246,7 +255,10 @@ void loop() {
       spinLeft(turn_pwm);
       if (leftTurnDone(elapsed)) {
         stopMotors();
-        if (localized) wall = (wall + 1) % 4;   // every left turn moves us one wall counter-clockwise
+        if (localized) {
+          wall = (wall + 1) % 4;   // every left turn moves us one wall counter-clockwise
+          event("TURN_LEFT"); Serial.print("done, now on the "); Serial.print(WALL_NAME[wall]); Serial.println(" wall");
+        }
         setState(LEFT_EXIT);
       }
       break;
@@ -266,6 +278,8 @@ void loop() {
         wps[current_wp].visited = true;
         wps_visited++;
         if (LED_PIN >= 0) digitalWrite(LED_PIN, LOW);
+        event("WAYPOINT"); Serial.print(wps[current_wp].name); Serial.print(" done, ");
+        Serial.print(wps_visited); Serial.print(" of "); Serial.print(NUM_WP); Serial.println(" visited");
         if (wps_visited >= NUM_WP) setState(DONE);
         else if (dist[AHEAD] <= cornerStopMm() + star_window_mm + 40) setState(TURN_LEFT);   // corner waypoint
         else setState(FOLLOW_WALL);                                                        // mid-wall waypoint
@@ -277,7 +291,7 @@ void loop() {
       break;
   }
 
-  printEvery200ms();
+  printStatusEvery500ms();
 }
 
 
@@ -304,9 +318,15 @@ void faceNearestWall() {
   stopMotors();
   delay(150);
 
+  event("SCAN");
+  if (best >= NO_ECHO) { Serial.println("no wall seen, driving forward anyway"); resyncAhead(NO_ECHO); return; }
+  Serial.print("nearest wall "); printMm(best);
+
   // a full turn put us back where we started: the shortest reading is best_ms ahead,
   // or scan_turn_ms - best_ms behind, whichever is shorter
-  if (best_ms <= (unsigned long)scan_turn_ms / 2) spinRight(scan_pwm);
+  bool go_right = best_ms <= (unsigned long)scan_turn_ms / 2;
+  Serial.println(go_right ? " away, turning back right to face it" : " away, turning back left to face it");
+  if (go_right) spinRight(scan_pwm);
   else { spinLeft(scan_pwm); best_ms = scan_turn_ms - best_ms; }
   delay(best_ms);
   stopMotors();
@@ -330,6 +350,7 @@ void squareUp() {
     }
     if (gained > 0) break;   // found the minimum this way, no need to try the other
   }
+  event("SQUARE_UP"); Serial.print("facing the wall straight on, "); printMm(best); Serial.println(" away");
   resyncAhead(best);
 }
 
@@ -345,9 +366,9 @@ void afterBackOff() {
   localized = true;
   reads_done = 0;
   fixPoseAtCorner();
-  Serial.print("LOCALIZED: wall on right = "); Serial.print(WALL_NAME[wall]);
-  Serial.print(", facing "); Serial.println(WALL_NAME[(wall + 1) % 4]);
-  printPose();
+  event("LOCALIZED"); Serial.print("on the "); Serial.print(WALL_NAME[wall]);
+  Serial.print(" wall, facing the "); Serial.print(WALL_NAME[(wall + 1) % 4]); Serial.print(" wall");
+  printPose(); Serial.println();
 
   if (MODE == 3) { setState(DONE); return; }
 
@@ -365,7 +386,7 @@ int wallFromColours(Colour on_right, Colour ahead) {
 }
 
 void relocalize() {
-  Serial.println("LOST: side wall gone, relocalizing");
+  event("LOST"); Serial.println("no wall on the right for 2.5 s, starting localization again (visited waypoints kept)");
   localized = false;
   reads_done = 0;
   setState(SCAN);   // visited waypoints stay visited
@@ -407,7 +428,11 @@ void checkAhead() {
   if (wp >= 0) {
     // inside the window, black on the floor is the star; past it, stop on distance
     float gap = dist[AHEAD] - waypointStopMm(wp);
+    int was = window_wp;
     window_wp = (gap <= star_window_mm) ? wp : -1;
+    if (window_wp >= 0 && was < 0) {
+      event("STAR"); Serial.print("close to "); Serial.print(wps[wp].name); Serial.println(", watching the floor for its star");
+    }
     if (gap <= -star_window_mm) arriveAtWaypoint(wp, false);
     return;
   }
@@ -431,9 +456,9 @@ int followSpeed() {
 void arriveAtWaypoint(int wp, bool on_star) {
   current_wp = wp;
   if (on_star) fixPoseAtStar(wp);
-  Serial.print("WAYPOINT "); Serial.print(wps[wp].name);
-  Serial.println(on_star ? " (saw star)" : " (by distance)");
-  printPose();
+  event("WAYPOINT"); Serial.print("reached "); Serial.print(wps[wp].name);
+  Serial.print(on_star ? ", saw the star" : ", missed the star so stopped by distance");
+  printPose(); Serial.println();
   if (LED_PIN >= 0) digitalWrite(LED_PIN, HIGH);
   setState(AT_WAYPOINT);
 }
@@ -627,7 +652,7 @@ bool onStar() {
 }
 
 // white reflects IR and black doesn't. 20 reads from each sensor, majority of all 40 decides
-Colour readColour() {
+Colour readColour(int n) {
   int right_white = 0, left_white = 0;
   for (int i = 0; i < 20; i++) {
     if (digitalRead(IR_RIGHT) == IR_WHITE) right_white++;
@@ -635,9 +660,10 @@ Colour readColour() {
     delay(2);
   }
   bool white = right_white + left_white > 20;
-  Serial.print("COLOUR: white reads right "); Serial.print(right_white);
-  Serial.print("/20 left "); Serial.print(left_white);
-  Serial.println(white ? "/20 -> white" : "/20 -> black");
+  event("COLOUR"); Serial.print("wall "); Serial.print(n); Serial.print(" of 2 is ");
+  Serial.print(white ? "WHITE" : "BLACK");
+  Serial.print(" (white reads: right "); Serial.print(right_white);
+  Serial.print("/20, left "); Serial.print(left_white); Serial.println("/20)");
   return white ? WHITE : BLACK;
 }
 
@@ -691,8 +717,25 @@ void setState(State s) {
     last_ctrl_ms = millis();       // no huge dt after a turn
     last_wall_seen_ms = millis();  // give it time to find the wall again
   }
-  Serial.print("-> ");
-  Serial.println(stateName(s));
+  stamp();
+  Serial.print("-> "); Serial.print(stateName(s));
+  Serial.print(": "); Serial.println(stateAction(s));
+}
+
+// what the robot is doing in each state, for the serial monitor
+const char* stateAction(State s) {
+  switch (s) {
+    case SCAN:          return "spinning one full turn to find the nearest wall";
+    case SEEK_WALL:     return "driving straight at the nearest wall";
+    case APPROACH_READ: return "creeping up to the wall to read its colour";
+    case BACK_OFF:      return "reversing back out to 250 mm";
+    case TURN_LEFT:     return localized ? "turning left at the corner" : "turning left so the wall is on the right";
+    case LEFT_EXIT:     return "pulling away from the corner";
+    case FOLLOW_WALL:   return "following the wall on the right";
+    case AT_WAYPOINT:   return "stopped on a waypoint for 3 s";
+    case DONE:          return "finished, motors off";
+  }
+  return "?";
 }
 
 const char* stateName(State s) {
@@ -711,40 +754,85 @@ const char* stateName(State s) {
 }
 
 
-// SERIAL OUTPUT: status line for the serial plotter, pose and settings
+// SERIAL OUTPUT: plain-English log. a line on every state change and event, plus a status line every 0.5 s
+//   12.4s  -> FOLLOW_WALL: following the wall on the right
+//   12.9s  FOLLOW_WALL | right wall 248 mm (want 250), angle +2 | ahead 830 mm | steering left 4 | next: BR in 120 mm | on the bottom wall, x 1080 y 251 heading 0
+//   13.6s  WAYPOINT: reached BR, saw the star, x 1250 y 250 heading 0
+
+// time since power-on, so you can see how long each step took
+void stamp() {
+  float s = millis() / 1000.0;
+  if (s < 100) Serial.print(' ');
+  if (s < 10) Serial.print(' ');
+  Serial.print(s, 1); Serial.print("s  ");
+}
+
+// start an event line, e.g. "  5.2s  COLOUR: "
+void event(const char* tag) {
+  stamp(); Serial.print(tag); Serial.print(": ");
+}
+
+void printMm(float mm) {
+  if (mm >= NO_ECHO) { Serial.print("no echo"); return; }
+  Serial.print(mm, 0); Serial.print(" mm");
+}
+
+void printPose() {
+  Serial.print(", x "); Serial.print(pose_x, 0);
+  Serial.print(" y "); Serial.print(pose_y, 0);
+  Serial.print(" heading "); Serial.print(pose_th, 0);
+}
+
 // print only between pings so serial never delays timing an echo
-void printEvery200ms() {
-  if (echo_phase != IDLE || millis() - last_print_ms < 200) return;
+void printStatusEvery500ms() {
+  if (echo_phase != IDLE || millis() - last_print_ms < 500) return;
   last_print_ms = millis();
   printStatus();
 }
 
 void printStatus() {
-  Serial.print("state:"); Serial.print((int)state);
-  Serial.print(" ahead:"); Serial.print(dist[AHEAD], 0);
-  Serial.print(" front:"); Serial.print(dist[FRONT], 0);
-  Serial.print(" back:"); Serial.print(dist[BACK], 0);
-  Serial.print(" d:"); Serial.print(d_mm, 0);
-  Serial.print(" theta:"); Serial.print(theta_deg, 1);
-  Serial.print(" steer:"); Serial.print(steer_out, 1);
-  Serial.print(" line:"); Serial.print(digitalRead(LINE_PIN));
-  if (MODE == 0) {
-    Serial.print(" irR:"); Serial.print(digitalRead(IR_RIGHT));
-    Serial.print(" irL:"); Serial.print(digitalRead(IR_LEFT));
+  stamp();
+  if (MODE == 0) {   // sensor check: every sensor in words
+    Serial.print("SENSORS | ahead "); printMm(dist[AHEAD]);
+    Serial.print(" | right side: front "); printMm(dist[FRONT]);
+    Serial.print(", back "); printMm(dist[BACK]);
+    Serial.print(" | floor "); Serial.print(digitalRead(LINE_PIN) == LINE_ON_TAPE ? "BLACK" : "white");
+    Serial.print(" | IR right "); Serial.print(digitalRead(IR_RIGHT) == IR_WHITE ? "white" : "black");
+    Serial.print(", left "); Serial.println(digitalRead(IR_LEFT) == IR_WHITE ? "white" : "black");
+    return;
   }
-  if (localized) {
-    Serial.print(" wall:"); Serial.print(wall);
-    Serial.print(" x:"); Serial.print(pose_x, 0);
-    Serial.print(" y:"); Serial.print(pose_y, 0);
-    Serial.print(" th:"); Serial.print(pose_th, 0);
-  }
-  Serial.println();
-}
 
-void printPose() {
-  Serial.print("POSE x="); Serial.print(pose_x, 0);
-  Serial.print(" y="); Serial.print(pose_y, 0);
-  Serial.print(" th="); Serial.println(pose_th, 0);
+  Serial.print(stateName(state));
+  if (state == DONE) { Serial.println(); return; }
+
+  Serial.print(" | right wall ");
+  if (sidesSeeWall(dist)) {
+    printMm(d_mm + side_off_mm);
+    Serial.print(" (want "); Serial.print(ring_mm, 0);
+    Serial.print("), angle "); if (theta_deg >= 0) Serial.print('+'); Serial.print(theta_deg, 0);
+  } else {
+    Serial.print("not seen");
+  }
+  Serial.print(" | ahead "); printMm(dist[AHEAD]);
+
+  if (state == FOLLOW_WALL) {
+    Serial.print(" | steering ");
+    if (abs(steer_out) < 1) Serial.print("straight");
+    else { Serial.print(steer_out > 0 ? "right " : "left "); Serial.print(abs(steer_out), 0); }
+    int wp = upcomingWaypoint();
+    Serial.print(" | next: ");
+    if (wp >= 0) { Serial.print(wps[wp].name); Serial.print(" in "); printMm(dist[AHEAD] - waypointStopMm(wp)); }
+    else { Serial.print("corner in "); printMm(dist[AHEAD] - cornerStopMm()); }
+    if (window_wp >= 0) Serial.print(", watching for the star");
+  }
+  if (state == AT_WAYPOINT) {
+    Serial.print(" | at "); Serial.print(wps[current_wp].name); Serial.print(", leaving in ");
+    Serial.print(max(0L, (long)hold_ms - (long)(millis() - state_start_ms)) / 1000.0, 1); Serial.print(" s");
+  }
+
+  if (localized) { Serial.print(" | on the "); Serial.print(WALL_NAME[wall]); Serial.print(" wall"); printPose(); }
+  else Serial.print(" | not localized yet");
+  Serial.println();
 }
 
 void printSettings() {
