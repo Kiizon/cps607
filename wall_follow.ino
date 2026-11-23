@@ -102,6 +102,7 @@ int use_median = 1;            // q  median of last 3 readings (0 = raw)
 float front_off_mm = 60;       // F  robot centre to the forward sensor face, measure
 float side_off_mm = 60;        // S  robot centre to the side sensor faces, measure
 float line_off_mm = 0;         // L  how far the line sensor sits ahead of the robot centre, measure
+int kick_ms = 40;              // K  full-power burst when a stopped motor starts, 0 = off
 
 
 // RUNTIME STATE: sensor readings, controller, localization and FSM variables
@@ -125,6 +126,7 @@ float integral_L = 0;
 float steer_L = 0, steer_H = 0, steer_I = 0, steer_out = 0;
 unsigned long last_ctrl_ms = 0;
 int fwd_pwm = 0;       // forward pwm actually commanded, for dead reckoning
+bool motors_stopped = true;   // the next start gets a kick
 
 bool localized = false;
 int wall = -1;         // wall on our right, valid once localized
@@ -166,7 +168,7 @@ void setup() {
   const char* const MODE_NAME[5] = {"sensors only, motors off", "drive straight",
     "follow the 250 mm ring forever", "localize, then stop", "full run: localize, then visit BR, TR, L"};
   Serial.print("MODE "); Serial.print(MODE); Serial.print(": "); Serial.println(MODE_NAME[MODE]);
-  Serial.println("tune: w p h i a s x m u n t e d b v r l j c k f z o y q F S L, g prints all");
+  Serial.println("tune: w p h i a s x m u n t e d b v r l j c k f z o y q F S L K, g prints all");
   if (MODE >= 1) {
     Serial.println("starting in 3 s, put the robot down");
     delay(3000);
@@ -708,10 +710,25 @@ Colour readColour(int n) {
 }
 
 
-// MOTORS: wheel commands, left_trim keeps straight driving straight
+// MOTORS: wheel commands, left_trim keeps straight driving straight, a kick gets them going from a stop
+// every motor command ends up here, as a pwm for each pin of the two wheels
+void setWheels(int lf, int lr, int rf, int rr) {
+  lf = constrain(lf, 0, 255); lr = constrain(lr, 0, 255);
+  rf = constrain(rf, 0, 255); rr = constrain(rr, 0, 255);
+  bool moving = lf || lr || rf || rr;
+  if (moving && motors_stopped && kick_ms > 0) {
+    // a stopped motor needs more push to start than to keep turning: full power for a moment
+    analogWrite(L_FWD, lf ? 255 : 0); analogWrite(L_REV, lr ? 255 : 0);
+    analogWrite(R_FWD, rf ? 255 : 0); analogWrite(R_REV, rr ? 255 : 0);
+    delay(kick_ms);
+  }
+  analogWrite(L_FWD, lf); analogWrite(L_REV, lr);
+  analogWrite(R_FWD, rf); analogWrite(R_REV, rr);
+  motors_stopped = !moving;
+}
+
 void drive(int left, int right) {
-  analogWrite(L_FWD, constrain(left - left_trim, 0, 255)); analogWrite(L_REV, 0);
-  analogWrite(R_FWD, constrain(right, 0, 255));            analogWrite(R_REV, 0);
+  setWheels(left - left_trim, 0, right, 0);
 }
 
 void driveStraightAt(int pwm) {   // keeps the integral's motor correction
@@ -719,18 +736,15 @@ void driveStraightAt(int pwm) {   // keeps the integral's motor correction
 }
 
 void driveReverseAt(int pwm) {
-  analogWrite(L_FWD, 0); analogWrite(L_REV, constrain(pwm - left_trim, 0, 255));
-  analogWrite(R_FWD, 0); analogWrite(R_REV, constrain(pwm, 0, 255));
+  setWheels(0, pwm - left_trim, 0, pwm);
 }
 
 void spinLeft(int pwm) {
-  analogWrite(R_FWD, pwm); analogWrite(R_REV, 0);
-  analogWrite(L_FWD, 0);   analogWrite(L_REV, pwm);
+  setWheels(0, pwm, pwm, 0);
 }
 
 void spinRight(int pwm) {
-  analogWrite(R_FWD, 0);   analogWrite(R_REV, pwm);
-  analogWrite(L_FWD, pwm); analogWrite(L_REV, 0);
+  setWheels(pwm, 0, 0, pwm);
 }
 
 // short timed spin then a pause, used by the scan and square-up
@@ -742,8 +756,7 @@ void spinStep(int dir, int ms) {
 }
 
 void stopMotors() {
-  analogWrite(R_FWD, 0); analogWrite(R_REV, 0);
-  analogWrite(L_FWD, 0); analogWrite(L_REV, 0);
+  setWheels(0, 0, 0, 0);
 }
 
 
@@ -890,7 +903,7 @@ void printSettings() {
   Serial.print(" z="); Serial.print(hold_ms);    Serial.print(" o="); Serial.print(slow_zone_mm);
   Serial.print(" y="); Serial.print(mm_per_s);   Serial.print(" q="); Serial.print(use_median);
   Serial.print(" F="); Serial.print(front_off_mm); Serial.print(" S="); Serial.print(side_off_mm);
-  Serial.print(" L="); Serial.println(line_off_mm);
+  Serial.print(" L="); Serial.print(line_off_mm); Serial.print(" K="); Serial.println(kick_ms);
 }
 
 
@@ -941,7 +954,8 @@ void applyCommand(char c, float v) {
     case 'F': front_off_mm = v; break;
     case 'S': side_off_mm = v; break;
     case 'L': line_off_mm = v; break;
-    default: Serial.println("unknown, use w p h i a s x m u n t e d b v r l j c k f z o y q F S L g"); return;
+    case 'K': kick_ms = max((int)v, 0); break;
+    default: Serial.println("unknown, use w p h i a s x m u n t e d b v r l j c k f z o y q F S L K g"); return;
   }
   integral_L = 0;   // restart the integral after any change
   printSettings();
