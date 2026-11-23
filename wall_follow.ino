@@ -20,7 +20,7 @@
 // 0 sensors only, 1 straight, 2 follow the 250 mm ring forever, 3 localize then stop, 4 full run
 
 
-// PINS: same as A3, plus the line sensor and the wall colour sensor
+// PINS: same as A3, plus the line sensor and the two wall colour sensors
 const int R_FWD = 6, R_REV = 5;     // right wheel
 const int L_FWD = 9, L_REV = 10;    // left wheel
 enum { BACK, FRONT, AHEAD };        // ping order
@@ -28,8 +28,8 @@ const int TRIG[3] = {7, 3, 12};
 const int ECHO[3] = {8, 4, 13};
 const int LINE_PIN = 2;             // downward line sensor, sees the black star on the floor
 const int LINE_ON_TAPE = 1;
-const int COLOUR_PIN = A0;          // forward IR reflectance sensor, reads the wall colour
-const bool WHITE_READS_HIGH = false;   // most TCRT5000 boards read low on white, flip if not
+const int IR_RIGHT = 0, IR_LEFT = 1;   // forward IR sensors (DO pins), free on the R4 Minima since USB serial doesn't use D0/D1
+const int IR_WHITE = LOW;           // most IR modules pull DO low when they see reflected IR (white), flip if not
 const int LED_PIN = -1;             // optional waypoint LED, -1 = none (13 is an echo pin)
 
 
@@ -87,7 +87,6 @@ int left_done_deg = 5;         // d  TURN_LEFT ends within this many degrees of 
 int exit_straight_ms = 150;    // b  LEFT_EXIT straight time
 int slow_pwm = 90;             // v  approach, back-off and slowest follow speed, keep above stall
 int read_mm = 50;              // r  forward range where the wall colour is read
-int colour_thr = 512;          // c  analog value halfway between black and white at read_mm
 int scan_steps = 26;           // l  scan steps, should add up to a bit more than one full turn
 int scan_step_ms = 60;         // j  spin time for one scan step (~15 deg)
 int sq_step_ms = 40;           // k  spin time for one square-up step (~5 deg)
@@ -155,11 +154,13 @@ void setup() {
   pinMode(R_FWD, OUTPUT); pinMode(R_REV, OUTPUT);
   pinMode(L_FWD, OUTPUT); pinMode(L_REV, OUTPUT);
   pinMode(LINE_PIN, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+  pinMode(IR_LEFT, INPUT);
   if (LED_PIN >= 0) pinMode(LED_PIN, OUTPUT);
   stopMotors();
 
   Serial.print("mode "); Serial.println(MODE);
-  Serial.println("tune: w p h i a s x m u n t e d b v r c l j k f z o y q F S L, g prints all");
+  Serial.println("tune: w p h i a s x m u n t e d b v r l j k f z o y q F S L, g prints all");
   if (MODE >= 1) delay(3000);   // time to put the robot down
   setState(SCAN);
 }
@@ -223,7 +224,7 @@ void loop() {
       break;
 
     case APPROACH_READ:
-      // creep in so the IR sensor is close enough to see the wall colour
+      // creep in so the IR sensors are close enough to see the wall colour
       driveStraightAt(slow_pwm);
       if (dist[AHEAD] <= read_mm || elapsed > READ_TIMEOUT_MS) {
         stopMotors();
@@ -602,7 +603,7 @@ void resyncAhead(float mm) {
 }
 
 
-// FLOOR AND WALL COLOUR SENSORS: line sensor for the stars, IR sensor for black vs white walls
+// FLOOR AND WALL COLOUR SENSORS: line sensor for the stars, two IR sensors for black vs white walls
 // on black for 20 ms straight, so one bad read can't stop the robot
 void updateLine() {
   if (digitalRead(LINE_PIN) != LINE_ON_TAPE) line_since_ms = 0;
@@ -613,14 +614,18 @@ bool onStar() {
   return line_since_ms != 0 && millis() - line_since_ms >= 20;
 }
 
-// average of 20 reads, white reflects IR and black doesn't
+// white reflects IR and black doesn't. 20 reads from each sensor, majority of all 40 decides
 Colour readColour() {
-  long sum = 0;
-  for (int i = 0; i < 20; i++) { sum += analogRead(COLOUR_PIN); delay(2); }
-  int v = sum / 20;
-  bool white = WHITE_READS_HIGH ? (v > colour_thr) : (v < colour_thr);
-  Serial.print("COLOUR: raw "); Serial.print(v);
-  Serial.println(white ? " -> white" : " -> black");
+  int right_white = 0, left_white = 0;
+  for (int i = 0; i < 20; i++) {
+    if (digitalRead(IR_RIGHT) == IR_WHITE) right_white++;
+    if (digitalRead(IR_LEFT) == IR_WHITE) left_white++;
+    delay(2);
+  }
+  bool white = right_white + left_white > 20;
+  Serial.print("COLOUR: white reads right "); Serial.print(right_white);
+  Serial.print("/20 left "); Serial.print(left_white);
+  Serial.println(white ? "/20 -> white" : "/20 -> black");
   return white ? WHITE : BLACK;
 }
 
@@ -711,7 +716,10 @@ void printStatus() {
   Serial.print(" theta:"); Serial.print(theta_deg, 1);
   Serial.print(" steer:"); Serial.print(steer_out, 1);
   Serial.print(" line:"); Serial.print(digitalRead(LINE_PIN));
-  if (MODE == 0) { Serial.print(" colour:"); Serial.print(analogRead(COLOUR_PIN)); }
+  if (MODE == 0) {
+    Serial.print(" irR:"); Serial.print(digitalRead(IR_RIGHT));
+    Serial.print(" irL:"); Serial.print(digitalRead(IR_LEFT));
+  }
   if (localized) {
     Serial.print(" wall:"); Serial.print(wall);
     Serial.print(" x:"); Serial.print(pose_x, 0);
@@ -736,7 +744,7 @@ void printSettings() {
   Serial.print(" n="); Serial.print(turn_min_ms); Serial.print(" t="); Serial.print(turn_max_ms);
   Serial.print(" e="); Serial.print(ahead_clear_mm); Serial.print(" d="); Serial.print(left_done_deg);
   Serial.print(" b="); Serial.print(exit_straight_ms); Serial.print(" v="); Serial.print(slow_pwm);
-  Serial.print(" r="); Serial.print(read_mm);    Serial.print(" c="); Serial.print(colour_thr);
+  Serial.print(" r="); Serial.print(read_mm);
   Serial.print(" l="); Serial.print(scan_steps); Serial.print(" j="); Serial.print(scan_step_ms);
   Serial.print(" k="); Serial.print(sq_step_ms); Serial.print(" f="); Serial.print(star_window_mm);
   Serial.print(" z="); Serial.print(hold_ms);    Serial.print(" o="); Serial.print(slow_zone_mm);
@@ -781,7 +789,6 @@ void applyCommand(char c, float v) {
     case 'b': exit_straight_ms = (int)v; break;
     case 'v': slow_pwm = (int)v; break;
     case 'r': read_mm = (int)v; break;
-    case 'c': colour_thr = (int)v; break;
     case 'l': scan_steps = (int)v; break;
     case 'j': scan_step_ms = (int)v; break;
     case 'k': sq_step_ms = (int)v; break;
@@ -793,7 +800,7 @@ void applyCommand(char c, float v) {
     case 'F': front_off_mm = v; break;
     case 'S': side_off_mm = v; break;
     case 'L': line_off_mm = v; break;
-    default: Serial.println("unknown, use w p h i a s x m u n t e d b v r c l j k f z o y q F S L g"); return;
+    default: Serial.println("unknown, use w p h i a s x m u n t e d b v r l j k f z o y q F S L g"); return;
   }
   integral_L = 0;   // restart the integral after any change
   printSettings();
