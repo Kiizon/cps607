@@ -1,29 +1,71 @@
-// cps607 a3: wall following, wall on the right at 15 cm
-// FOLLOW_WALL: sensors -> d, theta -> pi controller -> wheels
-// wall ahead -> TURN_LEFT -> LEFT_EXIT -> FOLLOW_WALL
-// wall ends -> CORNER_ADVANCE -> TURN_RIGHT -> FOLLOW_WALL
-// finish tape (any state) -> FINISH_PASS -> FINISHED
+// cps607 a4: the kidnapped robot
+//
+// localize: spin to face the nearest wall, drive to it and read its colour, turn left and
+// follow it (wall on the right) to the corner, then read the colour of the wall ahead.
+// counter-clockwise the walls go W B B W, so that colour pair names the wall we're on.
+//
+// navigate: keep following walls counter-clockwise 250 mm out. all 3 waypoints lie on that
+// path, so the robot stops at each one as it passes it.
+//
+// pose: while following, the side sensors give heading and the distance to the wall, the
+// front sensor gives the distance along it. dead reckoning fills the gaps.
+//
+// SCAN -> SEEK_WALL -> APPROACH_READ -> BACK_OFF -> TURN_LEFT -> LEFT_EXIT -> FOLLOW_WALL
+// FOLLOW_WALL, wall ahead, not localized -> APPROACH_READ -> BACK_OFF -> localized
+// FOLLOW_WALL, wall ahead, localized     -> TURN_LEFT
+// FOLLOW_WALL, at a waypoint             -> AT_WAYPOINT -> FOLLOW_WALL / TURN_LEFT / DONE
+// FOLLOW_WALL, side wall gone too long   -> SCAN (relocalize)
 
 #define MODE 4
-// 0 sensors only, 1 straight, 2 follow, 3 + left turns, 4 full course
+// 0 sensors only, 1 straight, 2 follow the 250 mm ring forever, 3 localize then stop, 4 full run
 
-const int R_FWD = 6, R_REV = 5;   // right wheel
-const int L_FWD = 9, L_REV = 10;  // left wheel
-enum { BACK, FRONT, AHEAD };      // ping order
+// pins (same as A3, plus the colour sensor)
+const int R_FWD = 6, R_REV = 5;     // right wheel
+const int L_FWD = 9, L_REV = 10;    // left wheel
+enum { BACK, FRONT, AHEAD };        // ping order
 const int TRIG[3] = {7, 3, 12};
 const int ECHO[3] = {8, 4, 13};
-const int LINE_PIN = 2;
+const int LINE_PIN = 2;             // downward line sensor, sees the black star on the floor
 const int LINE_ON_TAPE = 1;
+const int COLOUR_PIN = A0;          // forward IR reflectance sensor, reads the wall colour
+const bool WHITE_READS_HIGH = false;   // most TCRT5000 boards read low on white, flip if not
+const int LED_PIN = -1;             // optional waypoint LED, -1 = none (13 is an echo pin)
 
-const float L_MM = 103;                 // gap between the two side sensors
+// map: origin bottom-left, x right, y up, heading counter-clockwise from +x
+const float ARENA_MM = 1500;
+enum Colour { WHITE, BLACK };
+enum { W_BOTTOM, W_RIGHT, W_TOP, W_LEFT };   // counter-clockwise order
+const Colour WALL_COLOUR[4] = {WHITE, BLACK, BLACK, WHITE};
+const float WALL_NORMAL_DEG[4] = {-90, 0, 90, 180};   // direction from inside toward the wall
+const char* const WALL_NAME[4] = {"bottom", "right", "top", "left"};
+
+// wall = the wall on the robot's right when it reaches the waypoint
+struct Waypoint { const char* name; float x, y; int wall; bool visited; };
+Waypoint wps[] = {
+  {"BR", 1250, 250,  W_BOTTOM, false},
+  {"TR", 1250, 1250, W_RIGHT,  false},
+  {"L",  250,  750,  W_LEFT,   false},
+};
+const int NUM_WP = sizeof(wps) / sizeof(wps[0]);
+
+const float L_MM = 103;                       // gap between the two side sensors
 const float NO_ECHO = 4000;
-const float WALL_LOST_MM = 400;         // side reading past this = no wall
-const unsigned long PING_GAP_MS = 25;   // one sensor per 25 ms so echoes never overlap
-const unsigned long ECHO_TIMEOUT_US = 15000;   // ~2.5 m
-const float TURN_DONE_DEG = 25;
+const float WALL_LOST_MM = 450;               // side reading past this = no wall
+const float AHEAD_TRUST_MM = 1200;            // forward readings past this are too noisy for the pose
+const unsigned long PING_GAP_MS = 25;         // one sensor per 25 ms so echoes never overlap
+const unsigned long ECHO_TIMEOUT_US = 15000;  // ~2.5 m
+const float SEEK_STOP_MM = 300;               // SEEK_WALL stops here and squares up
+const float SCAN_MATCH_MM = 30;               // "back on the shortest reading" tolerance
+const unsigned long SEEK_TIMEOUT_MS = 8000;
+const unsigned long READ_TIMEOUT_MS = 5000;
+const unsigned long BACKOFF_TIMEOUT_MS = 4000;
+const unsigned long LOST_MS = 2500;           // side wall gone this long while localized -> relocalize
+const int SQ_MAX_STEPS = 8;
+const float SQ_GAIN_MM = 4;                   // a square-up step must shorten the range this much
+const float POSE_GAIN = 0.5;                  // share of each measurement that goes into the pose
 
 // tunables, set over serial as letter + number (p0.5), g prints all
-float target_mm = 150;         // w
+float ring_mm = 250;           // w  robot centre to the wall while following
 float Kp_L = 0.4;              // p  pwm per mm of distance error
 float Kp_H = 2.5;              // h  pwm per degree of heading error
 float Ki = 0.0;                // i
@@ -31,22 +73,26 @@ float max_approach_deg = 15;   // a  steepest angle the distance term may ask fo
 int base = 120;                // s  forward pwm
 int max_steer = 30;            // x
 int left_trim = 7;             // m  taken off the left wheel to drive straight
-int front_stop_mm = 170;       // f  wall ahead closer than this -> TURN_LEFT
 int turn_pwm = 150;            // u
 int turn_min_ms = 250;         // n
 int turn_max_ms = 700;         // t
 int ahead_clear_mm = 350;      // e  TURN_LEFT can't end until ahead is clear past this
-int overturn_ms = 0;           // o  extra spin after parallel (0 = off)
 int left_done_deg = 5;         // d  TURN_LEFT ends within this many degrees of parallel
 int exit_straight_ms = 150;    // b  LEFT_EXIT straight time
-int lost_cycles = 3;           // l  readings without the front side wall -> CORNER_ADVANCE
-int advance_ms = 0;            // v
-int arc_left = 200;            // k  TURN_RIGHT outer wheel
-int arc_right = 70;            // y  TURN_RIGHT inner wheel, stalls below ~70
-int arc_min_ms = 350;          // j
-int arc_max_ms = 2500;         // r
-int finish_pass_ms = 400;      // z
+int slow_pwm = 90;             // v  approach, back-off and slowest follow speed, keep above stall
+int read_mm = 50;              // r  forward range where the wall colour is read
+int colour_thr = 512;          // c  analog value halfway between black and white at read_mm
+int scan_steps = 26;           // l  scan steps, should add up to a bit more than one full turn
+int scan_step_ms = 60;         // j  spin time for one scan step (~15 deg)
+int sq_step_ms = 40;           // k  spin time for one square-up step (~5 deg)
+int star_window_mm = 50;       // f  look for the floor star this far either side of the expected spot, 0 = off
+int hold_ms = 3200;            // z  stop at each waypoint (3 s required + margin)
+int slow_zone_mm = 150;        // o  start slowing this far before a stop
+float mm_per_s = 200;          // y  forward speed at `base`, for dead reckoning
 int use_median = 1;            // q  median of last 3 readings (0 = raw)
+float front_off_mm = 60;       // F  robot centre to the forward sensor face, measure
+float side_off_mm = 60;        // S  robot centre to the side sensor faces, measure
+float line_off_mm = 0;         // L  how far the line sensor sits ahead of the robot centre, measure
 
 float raw[3] = {NO_ECHO, NO_ECHO, NO_ECHO};   // newest reading
 float hist[3][3];                             // last 3 readings per sensor
@@ -59,20 +105,31 @@ bool ahead_fresh = false;
 enum EchoPhase { IDLE, WAIT_RISE, WAIT_FALL };
 EchoPhase echo_phase = IDLE;
 unsigned long trig_us = 0, rise_us = 0;
+unsigned long line_since_ms = 0;
 
 float theta_deg = 0;   // + = nose away from the wall
-float d_mm = 0;
+float d_mm = 0;        // side sensor face to the wall
 
 float integral_L = 0;
 float steer_L = 0, steer_H = 0, steer_I = 0, steer_out = 0;
 unsigned long last_ctrl_ms = 0;
+int fwd_pwm = 0;       // forward pwm actually commanded, for dead reckoning
 
-enum State { FOLLOW_WALL, TURN_LEFT, LEFT_EXIT, CORNER_ADVANCE, TURN_RIGHT, FINISH_PASS, FINISHED };
-State state = FOLLOW_WALL;
+bool localized = false;
+int wall = -1;         // wall on our right, valid once localized
+Colour colours[2];     // first wall read, then the wall ahead at the corner
+int reads_done = 0;
+int wps_visited = 0;
+int current_wp = -1;
+int window_wp = -1;    // waypoint whose star window we're in, -1 = none
+float pose_x = 0, pose_y = 0, pose_th = 0;   // mm, mm, deg
+unsigned long last_pose_ms = 0;
+unsigned long last_wall_seen_ms = 0;
+
+enum State { SCAN, SEEK_WALL, APPROACH_READ, BACK_OFF, TURN_LEFT, LEFT_EXIT, FOLLOW_WALL, AT_WAYPOINT, DONE };
+State state = SCAN;
 unsigned long state_start_ms = 0;
-unsigned long overturn_start_ms = 0;
 int ahead_close_count = 0;
-int front_lost_count = 0;
 unsigned long last_print_ms = 0;
 
 char cmd[16];
@@ -89,93 +146,295 @@ void setup() {
   pinMode(R_FWD, OUTPUT); pinMode(R_REV, OUTPUT);
   pinMode(L_FWD, OUTPUT); pinMode(L_REV, OUTPUT);
   pinMode(LINE_PIN, INPUT);
+  if (LED_PIN >= 0) pinMode(LED_PIN, OUTPUT);
   stopMotors();
 
   Serial.print("mode "); Serial.println(MODE);
-  Serial.println("tune: w p h i a s x m f u n t e o d b l v k y j r z q, g prints all");
+  Serial.println("tune: w p h i a s x m u n t e d b v r c l j k f z o y q F S L, g prints all");
   if (MODE >= 1) delay(3000);   // time to put the robot down
-  setState(FOLLOW_WALL);
+  setState(SCAN);
 }
 
 void loop() {
   handleSerial();
   updateSensors();
+  updateLine();
 
-  if (MODE >= 2 && state != FINISH_PASS && state != FINISHED && onFinishLine()) setState(FINISH_PASS);
+  if (MODE == 0) { printEvery200ms(); return; }
+  if (MODE == 1) { driveStraightAt(base); printEvery200ms(); return; }
 
   if (sides_fresh) {
     sides_fresh = false;
-    if (sidesSeeWall(dist)) estimate(dist, theta_deg, d_mm);
+    if (sidesSeeWall(dist)) {
+      estimate(dist, theta_deg, d_mm);
+      last_wall_seen_ms = millis();
+    }
+    updatePose();
 
-    if (MODE >= 2 && state == FOLLOW_WALL) {
-      // outside corner: front side sensor passes the wall end while the back still sees it
-      bool front_lost = dist[FRONT] >= WALL_LOST_MM && dist[BACK] < WALL_LOST_MM;
-      front_lost_count = front_lost ? front_lost_count + 1 : 0;
-      int need_lost = use_median ? max(lost_cycles - 1, 1) : lost_cycles;   // median already needs 2 of 3
-
-      if (MODE == 4 && front_lost_count >= need_lost) {
-        setState(CORNER_ADVANCE);
-      } else if (sidesSeeWall(dist)) {
+    if (state == FOLLOW_WALL) {
+      int v = followSpeed();
+      if (sidesSeeWall(dist)) {
         float s = wallController();
-        drive(base + s, base - s);   // s > 0 turns right, toward the wall
+        drive(v + s, v - s);   // s > 0 turns right, toward the wall
       } else {
-        driveStraight();
+        driveStraightAt(v);
       }
+      if (localized && millis() - last_wall_seen_ms > LOST_MS) relocalize();
     }
   }
 
   if (ahead_fresh) {
     ahead_fresh = false;
-    if (MODE >= 3 && (state == FOLLOW_WALL || state == LEFT_EXIT)) {
-      ahead_close_count = (dist[AHEAD] < front_stop_mm) ? ahead_close_count + 1 : 0;
-      if (ahead_close_count >= (use_median ? 1 : 2)) setState(TURN_LEFT);
-    }
+    if (state == FOLLOW_WALL || state == LEFT_EXIT) checkAhead();
   }
+
+  // checked every loop, the star is small and passes under the sensor quickly
+  if (state == FOLLOW_WALL && window_wp >= 0 && onStar()) arriveAtWaypoint(window_wp, true);
 
   unsigned long elapsed = millis() - state_start_ms;   // after any state change above
   switch (state) {
+    case SCAN:
+      faceNearestWall();
+      setState(SEEK_WALL);
+      break;
+
+    case SEEK_WALL:
+      driveStraightAt(base);
+      if (dist[AHEAD] <= SEEK_STOP_MM) {
+        stopMotors();
+        squareUp();
+        setState(MODE >= 3 ? APPROACH_READ : BACK_OFF);
+      } else if (elapsed > SEEK_TIMEOUT_MS) {
+        // likely aimed into a corner where the echo glances off, turn a bit and retry
+        spinRight(turn_pwm); delay(250); stopMotors();
+        setState(SEEK_WALL);
+      }
+      break;
+
+    case APPROACH_READ:
+      // creep in so the IR sensor is close enough to see the wall colour
+      driveStraightAt(slow_pwm);
+      if (dist[AHEAD] <= read_mm || elapsed > READ_TIMEOUT_MS) {
+        stopMotors();
+        delay(250);   // let it stop rocking
+        colours[reads_done++] = readColour();
+        setState(BACK_OFF);
+      }
+      break;
+
+    case BACK_OFF:
+      // reverse until we're ring_mm from the wall, back on the waypoint path
+      driveReverseAt(slow_pwm);
+      if ((dist[AHEAD] >= cornerStopMm() && dist[AHEAD] < NO_ECHO) || elapsed > BACKOFF_TIMEOUT_MS) {
+        stopMotors();
+        afterBackOff();
+      }
+      break;
+
     case TURN_LEFT:
       spinLeft(turn_pwm);
-      if (overturn_start_ms == 0 && leftTurnDone(elapsed)) overturn_start_ms = millis();
-      if (overturn_start_ms != 0 && millis() - overturn_start_ms >= (unsigned long)max(overturn_ms, 0)) {
+      if (leftTurnDone(elapsed)) {
         stopMotors();
+        if (localized) wall = (wall + 1) % 4;   // every left turn moves us one wall counter-clockwise
         setState(LEFT_EXIT);
       }
       break;
+
     case LEFT_EXIT:
-      driveStraight();
+      fwd_pwm = base;
+      driveStraightAt(base);
       if (elapsed >= (unsigned long)exit_straight_ms) setState(FOLLOW_WALL);
       break;
-    case CORNER_ADVANCE:
-      driveStraight();
-      if (elapsed >= (unsigned long)advance_ms) setState(TURN_RIGHT);
-      break;
-    case TURN_RIGHT:
-      drive(arc_left, arc_right);
-      // wall back early = a missed echo, not a corner
-      if (elapsed < (unsigned long)arc_min_ms && sidesSeeWall(raw)) setState(FOLLOW_WALL);
-      else if (rightTurnDone(elapsed)) setState(FOLLOW_WALL);
-      break;
-    case FINISH_PASS:
-      driveStraight();
-      if (elapsed >= (unsigned long)finish_pass_ms) setState(FINISHED);
-      break;
-    case FINISHED:
+
+    case AT_WAYPOINT:
       stopMotors();
+      if (elapsed >= (unsigned long)hold_ms) {
+        wps[current_wp].visited = true;
+        wps_visited++;
+        if (LED_PIN >= 0) digitalWrite(LED_PIN, LOW);
+        if (wps_visited >= NUM_WP) setState(DONE);
+        else if (dist[AHEAD] <= cornerStopMm() + star_window_mm + 40) setState(TURN_LEFT);   // corner waypoint
+        else setState(FOLLOW_WALL);                                                        // mid-wall waypoint
+      }
       break;
-    default:
+
+    case FOLLOW_WALL:   // driven by the sensor updates above
+      break;
+
+    case DONE:
+      stopMotors();
       break;
   }
 
-  if (MODE == 1) drive(base, base);
+  printEvery200ms();
+}
 
-  // print only between pings so serial never delays timing an echo
-  if (echo_phase == IDLE && millis() - last_print_ms >= 200) {
-    last_print_ms = millis();
-    printStatus();
+
+// decisions
+
+float distToWall(int w, float x, float y) {
+  switch (w) {
+    case W_BOTTOM: return y;
+    case W_RIGHT:  return ARENA_MM - x;
+    case W_TOP:    return ARENA_MM - y;
+    default:       return x;
   }
 }
 
+// forward reading when the robot centre is on the waypoint (the wall ahead is the next one ccw)
+float waypointStopMm(int wp) {
+  return distToWall((wps[wp].wall + 1) % 4, wps[wp].x, wps[wp].y) - front_off_mm;
+}
+
+// turning here keeps the robot on the ring
+float cornerStopMm() {
+  return ring_mm - front_off_mm;
+}
+
+int waypointOnWall(int w) {
+  for (int i = 0; i < NUM_WP; i++)
+    if (wps[i].wall == w && !wps[i].visited) return i;
+  return -1;
+}
+
+int upcomingWaypoint() {
+  return localized ? waypointOnWall(wall) : -1;
+}
+
+void checkAhead() {
+  int wp = upcomingWaypoint();
+  if (wp >= 0) {
+    // inside the window, black on the floor is the star; past it, stop on distance
+    float gap = dist[AHEAD] - waypointStopMm(wp);
+    window_wp = (gap <= star_window_mm) ? wp : -1;
+    if (gap <= -star_window_mm) arriveAtWaypoint(wp, false);
+    return;
+  }
+
+  window_wp = -1;
+  ahead_close_count = (dist[AHEAD] <= cornerStopMm()) ? ahead_close_count + 1 : 0;
+  if (ahead_close_count < (use_median ? 1 : 2)) return;   // median already needs 2 of 3
+  setState(MODE >= 3 && !localized ? APPROACH_READ : TURN_LEFT);
+}
+
+// slow down before the next stop so we don't overshoot it, and cross the star slowly
+int followSpeed() {
+  int wp = upcomingWaypoint();
+  float stop = (wp >= 0) ? waypointStopMm(wp) + star_window_mm : cornerStopMm();
+  float gap = dist[AHEAD] - stop;
+  if (gap >= slow_zone_mm) fwd_pwm = base;
+  else fwd_pwm = slow_pwm + (base - slow_pwm) * max(gap, 0.0f) / slow_zone_mm;
+  return fwd_pwm;
+}
+
+void arriveAtWaypoint(int wp, bool on_star) {
+  current_wp = wp;
+  if (on_star) fixPoseAtStar(wp);
+  Serial.print("WAYPOINT "); Serial.print(wps[wp].name);
+  Serial.println(on_star ? " (saw star)" : " (by distance)");
+  printPose();
+  if (LED_PIN >= 0) digitalWrite(LED_PIN, HIGH);
+  setState(AT_WAYPOINT);
+}
+
+void afterBackOff() {
+  // first read (or MODE 2): turn so this wall is on our right, then follow it
+  if (MODE < 3 || reads_done < 2) {
+    setState(TURN_LEFT);
+    return;
+  }
+
+  // second read: colours[0] is the wall on our right, colours[1] the next wall ccw, ahead
+  wall = wallFromColours(colours[0], colours[1]);
+  localized = true;
+  reads_done = 0;
+  fixPoseAtCorner();
+  Serial.print("LOCALIZED: wall on right = "); Serial.print(WALL_NAME[wall]);
+  Serial.print(", facing "); Serial.println(WALL_NAME[(wall + 1) % 4]);
+  printPose();
+
+  if (MODE == 3) { setState(DONE); return; }
+
+  // we're on the ring corner at the end of this wall, which may itself be a waypoint
+  int wp = waypointOnWall(wall);
+  if (wp >= 0 && waypointStopMm(wp) <= cornerStopMm() + 1) arriveAtWaypoint(wp, false);
+  else setState(TURN_LEFT);
+}
+
+// each (wall, next wall) colour pair happens exactly once around W B B W
+int wallFromColours(Colour on_right, Colour ahead) {
+  for (int i = 0; i < 4; i++)
+    if (WALL_COLOUR[i] == on_right && WALL_COLOUR[(i + 1) % 4] == ahead) return i;
+  return 0;   // unreachable, all four pairs exist
+}
+
+void relocalize() {
+  Serial.println("LOST: side wall gone, relocalizing");
+  localized = false;
+  reads_done = 0;
+  setState(SCAN);   // visited waypoints stay visited
+}
+
+
+// pose
+
+// move one coordinate toward what the distance to wall w says it is
+void correctAxis(int w, float to_wall, float gain) {
+  switch (w) {
+    case W_BOTTOM: pose_y += gain * (to_wall - pose_y); break;
+    case W_RIGHT:  pose_x += gain * ((ARENA_MM - to_wall) - pose_x); break;
+    case W_TOP:    pose_y += gain * ((ARENA_MM - to_wall) - pose_y); break;
+    case W_LEFT:   pose_x += gain * (to_wall - pose_x); break;
+  }
+}
+
+float wrapDeg(float a) {
+  while (a > 180) a -= 360;
+  while (a <= -180) a += 360;
+  return a;
+}
+
+// just localized: on the ring at the end of `wall`, facing the next wall
+void fixPoseAtCorner() {
+  int ahead_wall = (wall + 1) % 4;
+  pose_th = WALL_NORMAL_DEG[ahead_wall];
+  correctAxis(wall, ring_mm, 1.0);
+  correctAxis(ahead_wall, dist[AHEAD] + front_off_mm, 1.0);
+  last_pose_ms = millis();
+}
+
+// the line sensor is over the star, so the centre is line_off_mm behind it
+void fixPoseAtStar(int wp) {
+  pose_x = wps[wp].x - line_off_mm * cos(radians(pose_th));
+  pose_y = wps[wp].y - line_off_mm * sin(radians(pose_th));
+}
+
+// predict from the commanded speed, then correct with whatever the walls say
+void updatePose() {
+  unsigned long now = millis();
+  float dt = (now - last_pose_ms) / 1000.0;
+  last_pose_ms = now;
+  if (!localized) return;
+
+  if (state == FOLLOW_WALL || state == LEFT_EXIT) {
+    float v = mm_per_s * fwd_pwm / base;
+    pose_x += v * dt * cos(radians(pose_th));
+    pose_y += v * dt * sin(radians(pose_th));
+  }
+
+  if (state == FOLLOW_WALL && sidesSeeWall(dist)) {
+    // wall on the right: heading is 90 deg left of the wall's normal, plus our angle to it
+    pose_th = wrapDeg(WALL_NORMAL_DEG[wall] + 90 + theta_deg);
+    correctAxis(wall, d_mm + side_off_mm, POSE_GAIN);
+    if (dist[AHEAD] < AHEAD_TRUST_MM) {
+      float along = dist[AHEAD] * cos(radians(theta_deg)) + front_off_mm;
+      correctAxis((wall + 1) % 4, along, POSE_GAIN);
+    }
+  }
+}
+
+
+// sensors
 
 // non-blocking ultrasonic: each call fires a ping or checks the echo pin, never waits
 void updateSensors() {
@@ -227,6 +486,103 @@ void estimate(const float *v, float &theta, float &d) {
   d = (v[FRONT] + v[BACK]) / 2.0 * cos(radians(theta));
 }
 
+// on black for 20 ms straight, so one bad read can't stop the robot
+void updateLine() {
+  if (digitalRead(LINE_PIN) != LINE_ON_TAPE) line_since_ms = 0;
+  else if (line_since_ms == 0) line_since_ms = millis();
+}
+
+bool onStar() {
+  return line_since_ms != 0 && millis() - line_since_ms >= 20;
+}
+
+// blocking ping, only used while stopped (scan and square-up)
+float pingBlocking(int s) {
+  digitalWrite(TRIG[s], LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG[s], HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG[s], LOW);
+  unsigned long t = pulseIn(ECHO[s], HIGH, ECHO_TIMEOUT_US);
+  return t == 0 ? NO_ECHO : t * 0.343 / 2;
+}
+
+float aheadMedian5() {
+  float r[5];
+  for (int i = 0; i < 5; i++) { r[i] = pingBlocking(AHEAD); delay(30); }
+  for (int a = 1; a < 5; a++) {   // insertion sort
+    float key = r[a];
+    int b = a - 1;
+    while (b >= 0 && r[b] > key) { r[b + 1] = r[b]; b--; }
+    r[b + 1] = key;
+  }
+  return r[2];
+}
+
+// after blocking reads, restart the forward filter so old values don't linger
+void resyncAhead(float mm) {
+  for (int k = 0; k < 3; k++) hist[AHEAD][k] = mm;
+  raw[AHEAD] = dist[AHEAD] = mm;
+  echo_phase = IDLE;
+  last_ping_ms = millis();
+}
+
+// average of 20 reads, white reflects IR and black doesn't
+Colour readColour() {
+  long sum = 0;
+  for (int i = 0; i < 20; i++) { sum += analogRead(COLOUR_PIN); delay(2); }
+  int v = sum / 20;
+  bool white = WHITE_READS_HIGH ? (v > colour_thr) : (v < colour_thr);
+  Serial.print("COLOUR: raw "); Serial.print(v);
+  Serial.println(white ? " -> white" : " -> black");
+  return white ? WHITE : BLACK;
+}
+
+
+// motion
+
+// the shortest range to a flat wall is straight at it, so: one full turn remembering the
+// shortest reading, then keep turning until we're back on it. no step angles needed.
+void faceNearestWall() {
+  echo_phase = IDLE;   // drop any half-finished non-blocking ping
+  stopMotors();
+  delay(150);
+  float best = NO_ECHO;
+  for (int i = 0; i < scan_steps; i++) {
+    best = min(best, aheadMedian5());
+    spinStep(1, scan_step_ms);
+  }
+  float r = aheadMedian5();
+  for (int i = 0; i < scan_steps && best < NO_ECHO && r > best + SCAN_MATCH_MM; i++) {
+    spinStep(1, scan_step_ms);
+    r = aheadMedian5();
+  }
+  resyncAhead(r);
+}
+
+// turn until the forward range stops getting shorter, i.e. facing the wall square
+void squareUp() {
+  echo_phase = IDLE;
+  delay(150);
+  float best = aheadMedian5();
+  int dir = 1;   // try right first
+  for (int pass = 0; pass < 2; pass++, dir = -dir) {
+    int gained = 0;
+    while (gained < SQ_MAX_STEPS) {
+      spinStep(dir, sq_step_ms);
+      float r = aheadMedian5();
+      if (r < best - SQ_GAIN_MM) { best = r; gained++; }
+      else { spinStep(-dir, sq_step_ms); break; }   // got worse: undo and stop
+    }
+    if (gained > 0) break;   // found the minimum this way, no need to try the other
+  }
+  resyncAhead(best);
+}
+
+void spinStep(int dir, int ms) {
+  if (dir > 0) spinRight(turn_pwm); else spinLeft(turn_pwm);
+  delay(ms);
+  stopMotors();
+  delay(120);
+}
 
 // steering pwm, + = turn right (toward the wall)
 float wallController() {
@@ -234,8 +590,9 @@ float wallController() {
   float dt = (now - last_ctrl_ms) / 1000.0;
   last_ctrl_ms = now;
 
-  float e_L = d_mm - target_mm;   // + = too far
-  float e_H = theta_deg;          // + = nose away
+  float target = ring_mm - side_off_mm;   // sensor-to-wall distance that puts the centre on the ring
+  float e_L = d_mm - target;              // + = too far
+  float e_H = theta_deg;                  // + = nose away
 
   // cap so the distance term alone never asks for more than max_approach_deg
   float cap = (Kp_H > 0) ? Kp_H * max_approach_deg : max_steer;
@@ -251,8 +608,7 @@ float wallController() {
   return steer_out;
 }
 
-
-// turn ends use raw readings, the median lags while spinning
+// uses raw readings, the median lags while spinning
 // theta is negative mid-spin (nose into the new wall) and rises toward 0
 bool leftTurnDone(unsigned long elapsed) {
   if (elapsed >= (unsigned long)turn_max_ms) return true;
@@ -263,55 +619,18 @@ bool leftTurnDone(unsigned long elapsed) {
   return th > -left_done_deg && raw[AHEAD] > ahead_clear_mm;
 }
 
-bool rightTurnDone(unsigned long elapsed) {
-  if (elapsed >= (unsigned long)arc_max_ms) return true;
-  if (elapsed < (unsigned long)arc_min_ms) return false;
-  if (!sidesSeeWall(raw)) return false;
-  float th, d;
-  estimate(raw, th, d);
-  return abs(th) < TURN_DONE_DEG;
-}
-
-// on tape for 30 ms straight, so one bad read can't end the run
-unsigned long line_seen_since = 0;
-bool onFinishLine() {
-  if (digitalRead(LINE_PIN) != LINE_ON_TAPE) { line_seen_since = 0; return false; }
-  if (line_seen_since == 0) line_seen_since = millis();
-  return millis() - line_seen_since >= 30;
-}
-
-void setState(State s) {
-  state = s;
-  state_start_ms = millis();
-  ahead_close_count = 0;
-  front_lost_count = 0;
-  overturn_start_ms = 0;
-  if (s == FOLLOW_WALL) last_ctrl_ms = millis();   // no huge dt after a turn
-  Serial.print("-> ");
-  Serial.println(stateName(s));
-}
-
-const char* stateName(State s) {
-  switch (s) {
-    case FOLLOW_WALL:    return "FOLLOW_WALL";
-    case TURN_LEFT:      return "TURN_LEFT";
-    case LEFT_EXIT:      return "LEFT_EXIT";
-    case CORNER_ADVANCE: return "CORNER_ADVANCE";
-    case TURN_RIGHT:     return "TURN_RIGHT";
-    case FINISH_PASS:    return "FINISH_PASS";
-    case FINISHED:       return "FINISHED";
-  }
-  return "?";
-}
-
-
 void drive(int left, int right) {
   analogWrite(L_FWD, constrain(left - left_trim, 0, 255)); analogWrite(L_REV, 0);
   analogWrite(R_FWD, constrain(right, 0, 255));            analogWrite(R_REV, 0);
 }
 
-void driveStraight() {   // keeps the integral's motor correction
-  drive(base + steer_I, base - steer_I);
+void driveStraightAt(int pwm) {   // keeps the integral's motor correction
+  drive(pwm + steer_I, pwm - steer_I);
+}
+
+void driveReverseAt(int pwm) {
+  analogWrite(L_FWD, 0); analogWrite(L_REV, constrain(pwm - left_trim, 0, 255));
+  analogWrite(R_FWD, 0); analogWrite(R_REV, constrain(pwm, 0, 255));
 }
 
 void spinLeft(int pwm) {
@@ -319,11 +638,53 @@ void spinLeft(int pwm) {
   analogWrite(L_FWD, 0);   analogWrite(L_REV, pwm);
 }
 
+void spinRight(int pwm) {
+  analogWrite(R_FWD, 0);   analogWrite(R_REV, pwm);
+  analogWrite(L_FWD, pwm); analogWrite(L_REV, 0);
+}
+
 void stopMotors() {
   analogWrite(R_FWD, 0); analogWrite(R_REV, 0);
   analogWrite(L_FWD, 0); analogWrite(L_REV, 0);
 }
 
+
+// state and printing
+
+void setState(State s) {
+  state = s;
+  state_start_ms = millis();
+  ahead_close_count = 0;
+  window_wp = -1;
+  if (s == FOLLOW_WALL) {
+    last_ctrl_ms = millis();       // no huge dt after a turn
+    last_wall_seen_ms = millis();  // give it time to find the wall again
+  }
+  Serial.print("-> ");
+  Serial.println(stateName(s));
+}
+
+const char* stateName(State s) {
+  switch (s) {
+    case SCAN:          return "SCAN";
+    case SEEK_WALL:     return "SEEK_WALL";
+    case APPROACH_READ: return "APPROACH_READ";
+    case BACK_OFF:      return "BACK_OFF";
+    case TURN_LEFT:     return "TURN_LEFT";
+    case LEFT_EXIT:     return "LEFT_EXIT";
+    case FOLLOW_WALL:   return "FOLLOW_WALL";
+    case AT_WAYPOINT:   return "AT_WAYPOINT";
+    case DONE:          return "DONE";
+  }
+  return "?";
+}
+
+// print only between pings so serial never delays timing an echo
+void printEvery200ms() {
+  if (echo_phase != IDLE || millis() - last_print_ms < 200) return;
+  last_print_ms = millis();
+  printStatus();
+}
 
 // name:value pairs for the serial plotter
 void printStatus() {
@@ -333,27 +694,40 @@ void printStatus() {
   Serial.print(" back:"); Serial.print(dist[BACK], 0);
   Serial.print(" d:"); Serial.print(d_mm, 0);
   Serial.print(" theta:"); Serial.print(theta_deg, 1);
-  Serial.print(" sL:"); Serial.print(steer_L, 1);
-  Serial.print(" sH:"); Serial.print(steer_H, 1);
-  Serial.print(" sI:"); Serial.print(steer_I, 1);
   Serial.print(" steer:"); Serial.print(steer_out, 1);
-  Serial.print(" line:"); Serial.println(digitalRead(LINE_PIN));
+  Serial.print(" line:"); Serial.print(digitalRead(LINE_PIN));
+  if (MODE == 0) { Serial.print(" colour:"); Serial.print(analogRead(COLOUR_PIN)); }
+  if (localized) {
+    Serial.print(" wall:"); Serial.print(wall);
+    Serial.print(" x:"); Serial.print(pose_x, 0);
+    Serial.print(" y:"); Serial.print(pose_y, 0);
+    Serial.print(" th:"); Serial.print(pose_th, 0);
+  }
+  Serial.println();
+}
+
+void printPose() {
+  Serial.print("POSE x="); Serial.print(pose_x, 0);
+  Serial.print(" y="); Serial.print(pose_y, 0);
+  Serial.print(" th="); Serial.println(pose_th, 0);
 }
 
 void printSettings() {
-  Serial.print("w="); Serial.print(target_mm);  Serial.print(" p="); Serial.print(Kp_L);
-  Serial.print(" h="); Serial.print(Kp_H);      Serial.print(" i="); Serial.print(Ki);
+  Serial.print("w="); Serial.print(ring_mm);     Serial.print(" p="); Serial.print(Kp_L);
+  Serial.print(" h="); Serial.print(Kp_H);       Serial.print(" i="); Serial.print(Ki);
   Serial.print(" a="); Serial.print(max_approach_deg);
-  Serial.print(" s="); Serial.print(base);      Serial.print(" x="); Serial.print(max_steer);
-  Serial.print(" m="); Serial.print(left_trim); Serial.print(" f="); Serial.print(front_stop_mm);
-  Serial.print(" u="); Serial.print(turn_pwm);  Serial.print(" n="); Serial.print(turn_min_ms);
-  Serial.print(" t="); Serial.print(turn_max_ms); Serial.print(" e="); Serial.print(ahead_clear_mm);
-  Serial.print(" o="); Serial.print(overturn_ms); Serial.print(" d="); Serial.print(left_done_deg);
-  Serial.print(" b="); Serial.print(exit_straight_ms);
-  Serial.print(" l="); Serial.print(lost_cycles); Serial.print(" v="); Serial.print(advance_ms);
-  Serial.print(" k="); Serial.print(arc_left); Serial.print(" y="); Serial.print(arc_right);
-  Serial.print(" j="); Serial.print(arc_min_ms); Serial.print(" r="); Serial.print(arc_max_ms);
-  Serial.print(" z="); Serial.print(finish_pass_ms); Serial.print(" q="); Serial.println(use_median);
+  Serial.print(" s="); Serial.print(base);       Serial.print(" x="); Serial.print(max_steer);
+  Serial.print(" m="); Serial.print(left_trim);  Serial.print(" u="); Serial.print(turn_pwm);
+  Serial.print(" n="); Serial.print(turn_min_ms); Serial.print(" t="); Serial.print(turn_max_ms);
+  Serial.print(" e="); Serial.print(ahead_clear_mm); Serial.print(" d="); Serial.print(left_done_deg);
+  Serial.print(" b="); Serial.print(exit_straight_ms); Serial.print(" v="); Serial.print(slow_pwm);
+  Serial.print(" r="); Serial.print(read_mm);    Serial.print(" c="); Serial.print(colour_thr);
+  Serial.print(" l="); Serial.print(scan_steps); Serial.print(" j="); Serial.print(scan_step_ms);
+  Serial.print(" k="); Serial.print(sq_step_ms); Serial.print(" f="); Serial.print(star_window_mm);
+  Serial.print(" z="); Serial.print(hold_ms);    Serial.print(" o="); Serial.print(slow_zone_mm);
+  Serial.print(" y="); Serial.print(mm_per_s);   Serial.print(" q="); Serial.print(use_median);
+  Serial.print(" F="); Serial.print(front_off_mm); Serial.print(" S="); Serial.print(side_off_mm);
+  Serial.print(" L="); Serial.println(line_off_mm);
 }
 
 // non-blocking: collects characters until newline, then applies the command
@@ -374,7 +748,7 @@ void handleSerial() {
 void applyCommand(char c, float v) {
   switch (c) {
     case 'g': printSettings(); return;
-    case 'w': target_mm = v; break;
+    case 'w': ring_mm = v; break;
     case 'p': Kp_L = v; break;
     case 'h': Kp_H = v; break;
     case 'i': Ki = v; break;
@@ -382,23 +756,27 @@ void applyCommand(char c, float v) {
     case 's': base = (int)v; break;
     case 'x': max_steer = (int)v; break;
     case 'm': left_trim = (int)v; break;
-    case 'f': front_stop_mm = (int)v; break;
     case 'u': turn_pwm = (int)v; break;
     case 'n': turn_min_ms = (int)v; break;
     case 't': turn_max_ms = (int)v; break;
     case 'e': ahead_clear_mm = (int)v; break;
-    case 'o': overturn_ms = max((int)v, 0); break;
     case 'd': left_done_deg = (int)v; break;
     case 'b': exit_straight_ms = (int)v; break;
-    case 'l': lost_cycles = (int)v; break;
-    case 'v': advance_ms = (int)v; break;
-    case 'k': arc_left = (int)v; break;
-    case 'y': arc_right = (int)v; break;
-    case 'j': arc_min_ms = (int)v; break;
-    case 'r': arc_max_ms = (int)v; break;
-    case 'z': finish_pass_ms = (int)v; break;
+    case 'v': slow_pwm = (int)v; break;
+    case 'r': read_mm = (int)v; break;
+    case 'c': colour_thr = (int)v; break;
+    case 'l': scan_steps = (int)v; break;
+    case 'j': scan_step_ms = (int)v; break;
+    case 'k': sq_step_ms = (int)v; break;
+    case 'f': star_window_mm = max((int)v, 0); break;
+    case 'z': hold_ms = (int)v; break;
+    case 'o': slow_zone_mm = max((int)v, 1); break;
+    case 'y': mm_per_s = v; break;
     case 'q': use_median = (int)v; break;
-    default: Serial.println("unknown, use w p h i a s x m f u n t e o d b l v k y j r z q g"); return;
+    case 'F': front_off_mm = v; break;
+    case 'S': side_off_mm = v; break;
+    case 'L': line_off_mm = v; break;
+    default: Serial.println("unknown, use w p h i a s x m u n t e d b v r c l j k f z o y q F S L g"); return;
   }
   integral_L = 0;   // restart the integral after any change
   printSettings();
