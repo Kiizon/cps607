@@ -19,7 +19,8 @@
 #define MODE 4
 // 0 sensors only, 1 straight, 2 follow the 250 mm ring forever, 3 localize then stop, 4 full run
 
-// pins (same as A3, plus the colour sensor)
+
+// PINS: same as A3, plus the line sensor and the wall colour sensor
 const int R_FWD = 6, R_REV = 5;     // right wheel
 const int L_FWD = 9, L_REV = 10;    // left wheel
 enum { BACK, FRONT, AHEAD };        // ping order
@@ -31,7 +32,9 @@ const int COLOUR_PIN = A0;          // forward IR reflectance sensor, reads the 
 const bool WHITE_READS_HIGH = false;   // most TCRT5000 boards read low on white, flip if not
 const int LED_PIN = -1;             // optional waypoint LED, -1 = none (13 is an echo pin)
 
-// map: origin bottom-left, x right, y up, heading counter-clockwise from +x
+
+// MAP: the arena, its wall colours and the waypoints
+// origin bottom-left, x right, y up, heading counter-clockwise from +x
 const float ARENA_MM = 1500;
 enum Colour { WHITE, BLACK };
 enum { W_BOTTOM, W_RIGHT, W_TOP, W_LEFT };   // counter-clockwise order
@@ -48,6 +51,8 @@ Waypoint wps[] = {
 };
 const int NUM_WP = sizeof(wps) / sizeof(wps[0]);
 
+
+// CONSTANTS: fixed limits and timeouts
 const float L_MM = 103;                       // gap between the two side sensors
 const float NO_ECHO = 4000;
 const float WALL_LOST_MM = 450;               // side reading past this = no wall
@@ -64,7 +69,8 @@ const int SQ_MAX_STEPS = 8;
 const float SQ_GAIN_MM = 4;                   // a square-up step must shorten the range this much
 const float POSE_GAIN = 0.5;                  // share of each measurement that goes into the pose
 
-// tunables, set over serial as letter + number (p0.5), g prints all
+
+// TUNABLES: set over serial as letter + number (p0.5), g prints all
 float ring_mm = 250;           // w  robot centre to the wall while following
 float Kp_L = 0.4;              // p  pwm per mm of distance error
 float Kp_H = 2.5;              // h  pwm per degree of heading error
@@ -94,6 +100,8 @@ float front_off_mm = 60;       // F  robot centre to the forward sensor face, me
 float side_off_mm = 60;        // S  robot centre to the side sensor faces, measure
 float line_off_mm = 0;         // L  how far the line sensor sits ahead of the robot centre, measure
 
+
+// RUNTIME STATE: sensor readings, controller, localization and FSM variables
 float raw[3] = {NO_ECHO, NO_ECHO, NO_ECHO};   // newest reading
 float hist[3][3];                             // last 3 readings per sensor
 float dist[3] = {NO_ECHO, NO_ECHO, NO_ECHO};  // filtered
@@ -136,6 +144,7 @@ char cmd[16];
 int cmd_len = 0;
 
 
+// SETUP: pins, filters and a 3 s pause to put the robot down
 void setup() {
   Serial.begin(115200);
   for (int s = 0; s < 3; s++) {
@@ -155,6 +164,8 @@ void setup() {
   setState(SCAN);
 }
 
+
+// MAIN LOOP: read sensors, react to new readings, then run the current FSM state
 void loop() {
   handleSerial();
   updateSensors();
@@ -246,6 +257,9 @@ void loop() {
       if (elapsed >= (unsigned long)exit_straight_ms) setState(FOLLOW_WALL);
       break;
 
+    case FOLLOW_WALL:   // driven by the sensor updates above
+      break;
+
     case AT_WAYPOINT:
       stopMotors();
       if (elapsed >= (unsigned long)hold_ms) {
@@ -258,9 +272,6 @@ void loop() {
       }
       break;
 
-    case FOLLOW_WALL:   // driven by the sensor updates above
-      break;
-
     case DONE:
       stopMotors();
       break;
@@ -270,8 +281,85 @@ void loop() {
 }
 
 
-// decisions
+// LOCALIZATION LOGIC: find the nearest wall, then name the wall from two colour readings
+// the shortest range to a flat wall is straight at it, so: one full turn remembering the
+// shortest reading, then keep turning until we're back on it. no step angles needed.
+void faceNearestWall() {
+  echo_phase = IDLE;   // drop any half-finished non-blocking ping
+  stopMotors();
+  delay(150);
+  float best = NO_ECHO;
+  for (int i = 0; i < scan_steps; i++) {
+    best = min(best, aheadMedian5());
+    spinStep(1, scan_step_ms);
+  }
+  float r = aheadMedian5();
+  for (int i = 0; i < scan_steps && best < NO_ECHO && r > best + SCAN_MATCH_MM; i++) {
+    spinStep(1, scan_step_ms);
+    r = aheadMedian5();
+  }
+  resyncAhead(r);
+}
 
+// turn until the forward range stops getting shorter, i.e. facing the wall square
+void squareUp() {
+  echo_phase = IDLE;
+  delay(150);
+  float best = aheadMedian5();
+  int dir = 1;   // try right first
+  for (int pass = 0; pass < 2; pass++, dir = -dir) {
+    int gained = 0;
+    while (gained < SQ_MAX_STEPS) {
+      spinStep(dir, sq_step_ms);
+      float r = aheadMedian5();
+      if (r < best - SQ_GAIN_MM) { best = r; gained++; }
+      else { spinStep(-dir, sq_step_ms); break; }   // got worse: undo and stop
+    }
+    if (gained > 0) break;   // found the minimum this way, no need to try the other
+  }
+  resyncAhead(best);
+}
+
+void afterBackOff() {
+  // first read (or MODE 2): turn so this wall is on our right, then follow it
+  if (MODE < 3 || reads_done < 2) {
+    setState(TURN_LEFT);
+    return;
+  }
+
+  // second read: colours[0] is the wall on our right, colours[1] the next wall ccw, ahead
+  wall = wallFromColours(colours[0], colours[1]);
+  localized = true;
+  reads_done = 0;
+  fixPoseAtCorner();
+  Serial.print("LOCALIZED: wall on right = "); Serial.print(WALL_NAME[wall]);
+  Serial.print(", facing "); Serial.println(WALL_NAME[(wall + 1) % 4]);
+  printPose();
+
+  if (MODE == 3) { setState(DONE); return; }
+
+  // we're on the ring corner at the end of this wall, which may itself be a waypoint
+  int wp = waypointOnWall(wall);
+  if (wp >= 0 && waypointStopMm(wp) <= cornerStopMm() + 1) arriveAtWaypoint(wp, false);
+  else setState(TURN_LEFT);
+}
+
+// each (wall, next wall) colour pair happens exactly once around W B B W
+int wallFromColours(Colour on_right, Colour ahead) {
+  for (int i = 0; i < 4; i++)
+    if (WALL_COLOUR[i] == on_right && WALL_COLOUR[(i + 1) % 4] == ahead) return i;
+  return 0;   // unreachable, all four pairs exist
+}
+
+void relocalize() {
+  Serial.println("LOST: side wall gone, relocalizing");
+  localized = false;
+  reads_done = 0;
+  setState(SCAN);   // visited waypoints stay visited
+}
+
+
+// NAVIGATION LOGIC: where to stop next (waypoint or corner) and how fast to approach it
 float distToWall(int w, float x, float y) {
   switch (w) {
     case W_BOTTOM: return y;
@@ -337,47 +425,8 @@ void arriveAtWaypoint(int wp, bool on_star) {
   setState(AT_WAYPOINT);
 }
 
-void afterBackOff() {
-  // first read (or MODE 2): turn so this wall is on our right, then follow it
-  if (MODE < 3 || reads_done < 2) {
-    setState(TURN_LEFT);
-    return;
-  }
 
-  // second read: colours[0] is the wall on our right, colours[1] the next wall ccw, ahead
-  wall = wallFromColours(colours[0], colours[1]);
-  localized = true;
-  reads_done = 0;
-  fixPoseAtCorner();
-  Serial.print("LOCALIZED: wall on right = "); Serial.print(WALL_NAME[wall]);
-  Serial.print(", facing "); Serial.println(WALL_NAME[(wall + 1) % 4]);
-  printPose();
-
-  if (MODE == 3) { setState(DONE); return; }
-
-  // we're on the ring corner at the end of this wall, which may itself be a waypoint
-  int wp = waypointOnWall(wall);
-  if (wp >= 0 && waypointStopMm(wp) <= cornerStopMm() + 1) arriveAtWaypoint(wp, false);
-  else setState(TURN_LEFT);
-}
-
-// each (wall, next wall) colour pair happens exactly once around W B B W
-int wallFromColours(Colour on_right, Colour ahead) {
-  for (int i = 0; i < 4; i++)
-    if (WALL_COLOUR[i] == on_right && WALL_COLOUR[(i + 1) % 4] == ahead) return i;
-  return 0;   // unreachable, all four pairs exist
-}
-
-void relocalize() {
-  Serial.println("LOST: side wall gone, relocalizing");
-  localized = false;
-  reads_done = 0;
-  setState(SCAN);   // visited waypoints stay visited
-}
-
-
-// pose
-
+// POSE ESTIMATION: dead reckoning between readings, corrected by the walls and the stars
 // move one coordinate toward what the distance to wall w says it is
 void correctAxis(int w, float to_wall, float gain) {
   switch (w) {
@@ -434,9 +483,45 @@ void updatePose() {
 }
 
 
-// sensors
+// WALL FOLLOWING CONTROL: A3 PI controller on distance + heading, and the left-turn end check
+// steering pwm, + = turn right (toward the wall)
+float wallController() {
+  unsigned long now = millis();
+  float dt = (now - last_ctrl_ms) / 1000.0;
+  last_ctrl_ms = now;
 
-// non-blocking ultrasonic: each call fires a ping or checks the echo pin, never waits
+  float target = ring_mm - side_off_mm;   // sensor-to-wall distance that puts the centre on the ring
+  float e_L = d_mm - target;              // + = too far
+  float e_H = theta_deg;                  // + = nose away
+
+  // cap so the distance term alone never asks for more than max_approach_deg
+  float cap = (Kp_H > 0) ? Kp_H * max_approach_deg : max_steer;
+  steer_L = constrain(Kp_L * e_L, -cap, cap);
+  steer_H = Kp_H * e_H;   // damping
+
+  // anti-windup: only integrate near the target, cap at 20 pwm
+  if (abs(e_L) < 50) integral_L += e_L * dt;
+  if (Ki > 0) integral_L = constrain(integral_L, -20 / Ki, 20 / Ki);
+  steer_I = Ki * integral_L;
+
+  steer_out = constrain(steer_L + steer_H + steer_I, -max_steer, max_steer);
+  return steer_out;
+}
+
+// uses raw readings, the median lags while spinning
+// theta is negative mid-spin (nose into the new wall) and rises toward 0
+bool leftTurnDone(unsigned long elapsed) {
+  if (elapsed >= (unsigned long)turn_max_ms) return true;
+  if (elapsed < (unsigned long)turn_min_ms) return false;
+  if (!sidesSeeWall(raw)) return false;
+  float th, d;
+  estimate(raw, th, d);
+  return th > -left_done_deg && raw[AHEAD] > ahead_clear_mm;
+}
+
+
+// ULTRASONIC SENSORS: non-blocking pings for driving, blocking pings for the scan, median filter
+// each call fires a ping or checks the echo pin, never waits
 void updateSensors() {
   unsigned long now = micros();
   int s = next_sensor;
@@ -481,19 +566,10 @@ bool sidesSeeWall(const float *v) {
   return v[BACK] < WALL_LOST_MM && v[FRONT] < WALL_LOST_MM;
 }
 
+// angle and distance to the wall from the two side sensors
 void estimate(const float *v, float &theta, float &d) {
   theta = degrees(atan2(v[FRONT] - v[BACK], L_MM));
   d = (v[FRONT] + v[BACK]) / 2.0 * cos(radians(theta));
-}
-
-// on black for 20 ms straight, so one bad read can't stop the robot
-void updateLine() {
-  if (digitalRead(LINE_PIN) != LINE_ON_TAPE) line_since_ms = 0;
-  else if (line_since_ms == 0) line_since_ms = millis();
-}
-
-bool onStar() {
-  return line_since_ms != 0 && millis() - line_since_ms >= 20;
 }
 
 // blocking ping, only used while stopped (scan and square-up)
@@ -525,6 +601,18 @@ void resyncAhead(float mm) {
   last_ping_ms = millis();
 }
 
+
+// FLOOR AND WALL COLOUR SENSORS: line sensor for the stars, IR sensor for black vs white walls
+// on black for 20 ms straight, so one bad read can't stop the robot
+void updateLine() {
+  if (digitalRead(LINE_PIN) != LINE_ON_TAPE) line_since_ms = 0;
+  else if (line_since_ms == 0) line_since_ms = millis();
+}
+
+bool onStar() {
+  return line_since_ms != 0 && millis() - line_since_ms >= 20;
+}
+
 // average of 20 reads, white reflects IR and black doesn't
 Colour readColour() {
   long sum = 0;
@@ -537,88 +625,7 @@ Colour readColour() {
 }
 
 
-// motion
-
-// the shortest range to a flat wall is straight at it, so: one full turn remembering the
-// shortest reading, then keep turning until we're back on it. no step angles needed.
-void faceNearestWall() {
-  echo_phase = IDLE;   // drop any half-finished non-blocking ping
-  stopMotors();
-  delay(150);
-  float best = NO_ECHO;
-  for (int i = 0; i < scan_steps; i++) {
-    best = min(best, aheadMedian5());
-    spinStep(1, scan_step_ms);
-  }
-  float r = aheadMedian5();
-  for (int i = 0; i < scan_steps && best < NO_ECHO && r > best + SCAN_MATCH_MM; i++) {
-    spinStep(1, scan_step_ms);
-    r = aheadMedian5();
-  }
-  resyncAhead(r);
-}
-
-// turn until the forward range stops getting shorter, i.e. facing the wall square
-void squareUp() {
-  echo_phase = IDLE;
-  delay(150);
-  float best = aheadMedian5();
-  int dir = 1;   // try right first
-  for (int pass = 0; pass < 2; pass++, dir = -dir) {
-    int gained = 0;
-    while (gained < SQ_MAX_STEPS) {
-      spinStep(dir, sq_step_ms);
-      float r = aheadMedian5();
-      if (r < best - SQ_GAIN_MM) { best = r; gained++; }
-      else { spinStep(-dir, sq_step_ms); break; }   // got worse: undo and stop
-    }
-    if (gained > 0) break;   // found the minimum this way, no need to try the other
-  }
-  resyncAhead(best);
-}
-
-void spinStep(int dir, int ms) {
-  if (dir > 0) spinRight(turn_pwm); else spinLeft(turn_pwm);
-  delay(ms);
-  stopMotors();
-  delay(120);
-}
-
-// steering pwm, + = turn right (toward the wall)
-float wallController() {
-  unsigned long now = millis();
-  float dt = (now - last_ctrl_ms) / 1000.0;
-  last_ctrl_ms = now;
-
-  float target = ring_mm - side_off_mm;   // sensor-to-wall distance that puts the centre on the ring
-  float e_L = d_mm - target;              // + = too far
-  float e_H = theta_deg;                  // + = nose away
-
-  // cap so the distance term alone never asks for more than max_approach_deg
-  float cap = (Kp_H > 0) ? Kp_H * max_approach_deg : max_steer;
-  steer_L = constrain(Kp_L * e_L, -cap, cap);
-  steer_H = Kp_H * e_H;   // damping
-
-  // anti-windup: only integrate near the target, cap at 20 pwm
-  if (abs(e_L) < 50) integral_L += e_L * dt;
-  if (Ki > 0) integral_L = constrain(integral_L, -20 / Ki, 20 / Ki);
-  steer_I = Ki * integral_L;
-
-  steer_out = constrain(steer_L + steer_H + steer_I, -max_steer, max_steer);
-  return steer_out;
-}
-
-// uses raw readings, the median lags while spinning
-// theta is negative mid-spin (nose into the new wall) and rises toward 0
-bool leftTurnDone(unsigned long elapsed) {
-  if (elapsed >= (unsigned long)turn_max_ms) return true;
-  if (elapsed < (unsigned long)turn_min_ms) return false;
-  if (!sidesSeeWall(raw)) return false;
-  float th, d;
-  estimate(raw, th, d);
-  return th > -left_done_deg && raw[AHEAD] > ahead_clear_mm;
-}
-
+// MOTORS: wheel commands, left_trim keeps straight driving straight
 void drive(int left, int right) {
   analogWrite(L_FWD, constrain(left - left_trim, 0, 255)); analogWrite(L_REV, 0);
   analogWrite(R_FWD, constrain(right, 0, 255));            analogWrite(R_REV, 0);
@@ -643,14 +650,21 @@ void spinRight(int pwm) {
   analogWrite(L_FWD, pwm); analogWrite(L_REV, 0);
 }
 
+// short timed spin then a pause, used by the scan and square-up
+void spinStep(int dir, int ms) {
+  if (dir > 0) spinRight(turn_pwm); else spinLeft(turn_pwm);
+  delay(ms);
+  stopMotors();
+  delay(120);
+}
+
 void stopMotors() {
   analogWrite(R_FWD, 0); analogWrite(R_REV, 0);
   analogWrite(L_FWD, 0); analogWrite(L_REV, 0);
 }
 
 
-// state and printing
-
+// STATE CHANGES: every transition goes through setState so timers and counters reset
 void setState(State s) {
   state = s;
   state_start_ms = millis();
@@ -679,6 +693,8 @@ const char* stateName(State s) {
   return "?";
 }
 
+
+// SERIAL OUTPUT: status line for the serial plotter, pose and settings
 // print only between pings so serial never delays timing an echo
 void printEvery200ms() {
   if (echo_phase != IDLE || millis() - last_print_ms < 200) return;
@@ -686,7 +702,6 @@ void printEvery200ms() {
   printStatus();
 }
 
-// name:value pairs for the serial plotter
 void printStatus() {
   Serial.print("state:"); Serial.print((int)state);
   Serial.print(" ahead:"); Serial.print(dist[AHEAD], 0);
@@ -730,6 +745,8 @@ void printSettings() {
   Serial.print(" L="); Serial.println(line_off_mm);
 }
 
+
+// SERIAL TUNING: change a tunable live by sending its letter + a number
 // non-blocking: collects characters until newline, then applies the command
 void handleSerial() {
   while (Serial.available()) {
