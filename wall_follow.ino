@@ -64,6 +64,10 @@ const unsigned long SEEK_TIMEOUT_MS = 8000;
 const unsigned long READ_TIMEOUT_MS = 5000;
 const unsigned long BACKOFF_TIMEOUT_MS = 4000;
 const unsigned long LOST_MS = 2500;           // side wall gone this long while localized -> relocalize
+const int SCAN_MAX_SAMPLES = 160;             // readings kept during one scan
+const int SIG_LEN = 6;                        // readings in the start fingerprint (~40 deg)
+const int SIG_SKIP = 2;                       // first readings, before the median filter is full
+const float SCAN_CLIP_MM = 2000;              // farther readings all count as "far" when matching
 const int SQ_MAX_STEPS = 8;
 const float SQ_GAIN_MM = 4;                   // a square-up step must shorten the range this much
 const float POSE_GAIN = 0.5;                  // share of each measurement that goes into the pose
@@ -86,8 +90,9 @@ int left_done_deg = 5;         // d  TURN_LEFT ends within this many degrees of 
 int exit_straight_ms = 150;    // b  LEFT_EXIT straight time
 int slow_pwm = 90;             // v  approach, back-off and slowest follow speed, keep above stall
 int read_mm = 50;              // r  forward range where the wall colour is read
-int scan_turn_ms = 2000;       // l  time for one full turn at scan_pwm, measure
+int scan_turn_ms = 2000;       // l  rough time for one full turn at scan_pwm, each scan measures and updates it
 int scan_pwm = 120;            // j  scan spin speed, slower = finer aim, keep above stall
+int scan_match_mm = 30;        // c  how close the fingerprint must match to count as back at the start
 int sq_step_ms = 40;           // k  spin time for one square-up step (~5 deg)
 int star_window_mm = 50;       // f  look for the floor star this far either side of the expected spot, 0 = off
 int hold_ms = 3200;            // z  stop at each waypoint (3 s required + margin)
@@ -161,7 +166,7 @@ void setup() {
   const char* const MODE_NAME[5] = {"sensors only, motors off", "drive straight",
     "follow the 250 mm ring forever", "localize, then stop", "full run: localize, then visit BR, TR, L"};
   Serial.print("MODE "); Serial.print(MODE); Serial.print(": "); Serial.println(MODE_NAME[MODE]);
-  Serial.println("tune: w p h i a s x m u n t e d b v r l j k f z o y q F S L, g prints all");
+  Serial.println("tune: w p h i a s x m u n t e d b v r l j c k f z o y q F S L, g prints all");
   if (MODE >= 1) {
     Serial.println("starting in 3 s, put the robot down");
     delay(3000);
@@ -296,39 +301,74 @@ void loop() {
 
 
 // LOCALIZATION LOGIC: find the nearest wall, then name the wall from two colour readings
-// the shortest range to a flat wall is straight at it. spin one full turn without stopping,
-// pinging the whole way, and note when the shortest reading came. then spin back to that
-// moment the short way round. SEEK_WALL squares up exactly once it's close.
+// the shortest range to a flat wall is straight at it, so spin without stopping, pinging the
+// whole way. the first few readings are a fingerprint of the starting direction: when the
+// latest few readings match it again, we've turned exactly 360. that also measures how long
+// a full turn takes right now (battery changes it), so the spin back to the shortest reading
+// is timed from this scan. SEEK_WALL squares up exactly once it's close.
 void faceNearestWall() {
+  static float r[SCAN_MAX_SAMPLES];           // filtered reading
+  static unsigned long t[SCAN_MAX_SAMPLES];   // when it was taken, ms since the spin started
   echo_phase = IDLE;   // drop any half-finished non-blocking ping
-  float r0 = NO_ECHO, r1 = NO_ECHO, r2 = NO_ECHO;
-  unsigned long t0 = 0, t1 = 0;
-  float best = NO_ECHO;
-  unsigned long best_ms = 0;
+  float p0 = NO_ECHO, p1 = NO_ECHO, p2 = NO_ECHO;
+  unsigned long prev_ping = 0;
+  const int sig_end = SIG_SKIP + SIG_LEN - 1;   // last reading of the fingerprint
+  int n = 0, match_at = -1;
+  float best_match = 1e9;
   unsigned long start = millis();
+
   spinRight(scan_pwm);
-  while (millis() - start < (unsigned long)scan_turn_ms) {
-    r2 = r1; r1 = r0; t1 = t0;
-    t0 = millis() - start;
-    r0 = pingBlocking(AHEAD);
-    float m = median3(r0, r1, r2);              // one stray echo can't fake the nearest wall
-    if (m < best) { best = m; best_ms = t1; }   // the median is centred on the middle ping
+  while (n < SCAN_MAX_SAMPLES && millis() - start < (unsigned long)(1.4 * scan_turn_ms)) {
+    p2 = p1; p1 = p0;
+    unsigned long now = millis() - start;
+    p0 = pingBlocking(AHEAD);
+    r[n] = min(median3(p0, p1, p2), SCAN_CLIP_MM);   // median: one stray echo can't fake a wall
+    t[n] = prev_ping;                                 // the median is centred on the middle ping
+    prev_ping = now;
+    n++;
+
+    // most of the way round, compare the latest readings with the fingerprint
+    if (n > sig_end + SIG_LEN && t[n - 1] > 0.8 * scan_turn_ms) {
+      float diff = 0;
+      for (int k = 0; k < SIG_LEN; k++) diff += abs(r[n - SIG_LEN + k] - r[SIG_SKIP + k]);
+      diff /= SIG_LEN;
+      if (diff < best_match) { best_match = diff; match_at = n - 1; }
+      else if (best_match < scan_match_mm) break;   // just passed the best match: back at the start
+    }
     delay(PING_GAP_MS);
   }
   stopMotors();
   delay(150);
+  long now = millis() - start;
 
+  // how long one full turn took: from the end of the fingerprint to the end of its match
+  long period = scan_turn_ms;
   event("SCAN");
-  if (best >= NO_ECHO) { Serial.println("no wall seen, driving forward anyway"); resyncAhead(NO_ECHO); return; }
-  Serial.print("nearest wall "); printMm(best);
+  if (match_at >= 0 && best_match < scan_match_mm) {
+    long p = t[match_at] - t[sig_end];
+    if (p > 0.8 * scan_turn_ms && p < 1.3 * scan_turn_ms) period = p;
+  }
+  if (period != scan_turn_ms) {
+    Serial.print("back at the start, a full turn took "); Serial.print(period);
+    Serial.print(" ms (fingerprint off by "); Serial.print(best_match, 0); Serial.print(" mm)");
+    scan_turn_ms = period;   // remembered for the next scan
+  } else {
+    Serial.print("couldn't match the start, using l = "); Serial.print(scan_turn_ms); Serial.print(" ms for a full turn");
+  }
 
-  // a full turn put us back where we started: the shortest reading is best_ms ahead,
-  // or scan_turn_ms - best_ms behind, whichever is shorter
-  bool go_right = best_ms <= (unsigned long)scan_turn_ms / 2;
-  Serial.println(go_right ? " away, turning back right to face it" : " away, turning back left to face it");
-  if (go_right) spinRight(scan_pwm);
-  else { spinLeft(scan_pwm); best_ms = scan_turn_ms - best_ms; }
-  delay(best_ms);
+  int bi = 0;
+  for (int i = 1; i < n; i++) if (r[i] < r[bi]) bi = i;
+  if (r[bi] >= SCAN_CLIP_MM) { Serial.println(", no wall seen, driving forward anyway"); resyncAhead(NO_ECHO); return; }
+  Serial.print(", nearest wall "); printMm(r[bi]);
+
+  // headings repeat every period: turning right we'd reach the shortest reading after `ahead` ms,
+  // turning left after period - ahead. take the shorter way
+  long ahead = ((long)t[bi] - now) % period;
+  if (ahead < 0) ahead += period;
+  bool go_right = ahead <= period / 2;
+  Serial.println(go_right ? ", turning right to face it" : ", turning left to face it");
+  if (go_right) spinRight(scan_pwm); else spinLeft(scan_pwm);
+  delay(go_right ? ahead : period - ahead);
   stopMotors();
   delay(150);
   resyncAhead(aheadMedian5());
@@ -845,7 +885,7 @@ void printSettings() {
   Serial.print(" e="); Serial.print(ahead_clear_mm); Serial.print(" d="); Serial.print(left_done_deg);
   Serial.print(" b="); Serial.print(exit_straight_ms); Serial.print(" v="); Serial.print(slow_pwm);
   Serial.print(" r="); Serial.print(read_mm);
-  Serial.print(" l="); Serial.print(scan_turn_ms); Serial.print(" j="); Serial.print(scan_pwm);
+  Serial.print(" l="); Serial.print(scan_turn_ms); Serial.print(" j="); Serial.print(scan_pwm); Serial.print(" c="); Serial.print(scan_match_mm);
   Serial.print(" k="); Serial.print(sq_step_ms); Serial.print(" f="); Serial.print(star_window_mm);
   Serial.print(" z="); Serial.print(hold_ms);    Serial.print(" o="); Serial.print(slow_zone_mm);
   Serial.print(" y="); Serial.print(mm_per_s);   Serial.print(" q="); Serial.print(use_median);
@@ -891,6 +931,7 @@ void applyCommand(char c, float v) {
     case 'r': read_mm = (int)v; break;
     case 'l': scan_turn_ms = (int)v; break;
     case 'j': scan_pwm = (int)v; break;
+    case 'c': scan_match_mm = (int)v; break;
     case 'k': sq_step_ms = (int)v; break;
     case 'f': star_window_mm = max((int)v, 0); break;
     case 'z': hold_ms = (int)v; break;
@@ -900,7 +941,7 @@ void applyCommand(char c, float v) {
     case 'F': front_off_mm = v; break;
     case 'S': side_off_mm = v; break;
     case 'L': line_off_mm = v; break;
-    default: Serial.println("unknown, use w p h i a s x m u n t e d b v r l j k f z o y q F S L g"); return;
+    default: Serial.println("unknown, use w p h i a s x m u n t e d b v r l j c k f z o y q F S L g"); return;
   }
   integral_L = 0;   // restart the integral after any change
   printSettings();
