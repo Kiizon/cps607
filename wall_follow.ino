@@ -4,16 +4,20 @@
 // robot goes counter-clockwise around the arena. with no wall in sight it drives straight
 // until it reaches one.
 //
-// localize: at every corner the robot stops facing the next wall and reads its colour with
-// the two forward IR sensors (white reflects IR, black doesn't). counter-clockwise the walls
-// go W B B W, so the colours at two corners in a row name the wall ahead:
-// (W,B) right, (B,B) top, (B,W) left, (W,W) bottom.
+// localize: at every stop the robot faces a wall and reads its colour with the two forward IR
+// sensors (white reflects IR, black doesn't). counter-clockwise the walls go W B B W, so the
+// colours of two neighbouring walls name them: (W,B) bottom then right, (B,B) right then top,
+// (B,W) top then left, (W,W) left then bottom.
+// after the first stop it only has one colour, so it turns right to face the clockwise
+// neighbour, creeps in if that wall is too far to read, and reads it too. then it turns
+// left 180 so the first wall is on its right, and follows it.
 //
 // navigate: once localized, each left turn moves one wall on. BR and TR are corners, so the
 // robot stops there. L is half way down the left wall, reached by driving l_time_ms after
 // the top-left turn.
 //
 // FOLLOW_WALL -> black wall close on the ahead sensor, or IR sees white -> CORNER (read colour)
+// CORNER      -> first colour -> TURN_RIGHT -> CHECK_RIGHT (creep if needed, read) -> TURN_LEFT 180
 // CORNER      -> at BR or TR, not visited yet -> AT_WAYPOINT -> TURN_LEFT
 // CORNER      -> anywhere else                -> TURN_LEFT -> LEFT_EXIT -> FOLLOW_WALL
 // FOLLOW_WALL -> l_time_ms after the top-left turn -> AT_WAYPOINT -> FOLLOW_WALL
@@ -59,6 +63,9 @@ const float WALL_LOST_MM = 400;         // side reading past this = no wall
 const float IR_GATE_MM = 400;           // only trust the IR when the ahead sensor also sees a wall this close
 const unsigned long PING_GAP_MS = 25;   // one sensor per 25 ms so echoes never overlap
 const unsigned long ECHO_TIMEOUT_US = 15000;   // ~2.5 m
+const unsigned long SETTLE_MS = 300;    // stopped this long after a turn so the ahead median is fresh
+const unsigned long CHECK_TIMEOUT_MS = 8000;   // CHECK_RIGHT gives up creeping after this
+const int SURE_READS = 15;              // of 20 IR reads, this many must agree for a colour to count
 
 
 // TUNABLES: set over serial as letter + number (p0.5), g prints all
@@ -78,6 +85,7 @@ int ahead_clear_mm = 350;      // e  TURN_LEFT can't end until ahead is clear pa
 int overturn_ms = 0;           // o  extra spin after parallel (0 = off)
 int left_done_deg = 5;         // d  TURN_LEFT ends within this many degrees of parallel
 int exit_straight_ms = 150;    // b  LEFT_EXIT straight time
+int right_turn_ms = 450;       // r  time for a 90 deg right turn at turn_pwm, tune
 int hold_ms = 3200;            // z  stop at each waypoint (3 s required + margin)
 int l_time_ms = 2500;          // l  drive time from the top-left turn to waypoint L (500 mm), tune
 float mm_per_s = 200;          // y  forward speed at `base`, for the pose estimate, tune
@@ -112,6 +120,10 @@ bool localized = false;
 int ahead_wall = -1;          // wall faced at the last corner; while following it's the wall on the right
 int last_colour = -1;         // colour seen at the previous corner, -1 = none yet
 bool stopped_by_ir = false;
+bool colour_sure = false;     // both IR sensors agreed on the last colour read
+bool turn_around = false;     // the next TURN_LEFT is 180 deg, after a right check
+bool crept = false;           // CHECK_RIGHT had to drive in to read the wall
+unsigned long settle_ms = 0;  // when CHECK_RIGHT stopped at the wall, 0 = not yet
 bool visited[NUM_WP] = {false, false, false};
 int wps_visited = 0;
 int current_wp = -1;
@@ -119,7 +131,7 @@ unsigned long l_timer_ms = 0; // when the top-left turn finished, 0 = not headin
 float pose_x = 0, pose_y = 0, pose_th = 0;   // mm, mm, deg
 unsigned long last_pose_ms = 0;
 
-enum State { FOLLOW_WALL, CORNER, AT_WAYPOINT, TURN_LEFT, LEFT_EXIT, DONE };
+enum State { FOLLOW_WALL, CORNER, TURN_RIGHT, CHECK_RIGHT, AT_WAYPOINT, TURN_LEFT, LEFT_EXIT, DONE };
 State state = FOLLOW_WALL;
 unsigned long state_start_ms = 0;
 unsigned long overturn_start_ms = 0;
@@ -147,7 +159,7 @@ void setup() {
   const char* const MODE_NAME[5] = {"sensors only, motors off", "drive straight", "follow the wall",
     "follow, turn at corners and localize", "full run: localize, then visit BR, TR, L"};
   Serial.print("MODE "); Serial.print(MODE); Serial.print(": "); Serial.println(MODE_NAME[MODE]);
-  Serial.println("tune: w p h i a s x m f u n t e o d b z l y c k q, g prints all");
+  Serial.println("tune: w p h i a s x m f u n t e o d b r z l y c k q, g prints all");
   if (MODE >= 1) {
     Serial.println("starting in 3 s, put the robot down");
     delay(3000);
@@ -208,6 +220,31 @@ void loop() {
       if (elapsed >= 250) handleCorner(readColour());   // let it stop rocking first
       break;
 
+    case TURN_RIGHT:
+      spinRight(turn_pwm);
+      if (elapsed >= (unsigned long)right_turn_ms) setState(CHECK_RIGHT);
+      break;
+
+    case CHECK_RIGHT:
+      if (settle_ms != 0) {
+        stopMotors();
+        if (millis() - settle_ms >= 250) handleRightCheck(readColour());   // let it stop rocking first
+      } else if (elapsed < SETTLE_MS) {
+        stopMotors();   // wait for fresh ahead readings in the new direction
+      } else if (dist[AHEAD] < front_stop_mm || (irSeesWhite() && dist[AHEAD] < IR_GATE_MM) || elapsed > CHECK_TIMEOUT_MS) {
+        stopMotors();   // close enough to read the colour
+        settle_ms = millis();
+        event("CHECK_RIGHT");
+        if (elapsed > CHECK_TIMEOUT_MS) Serial.println("no wall after 8 s, reading anyway");
+        else if (crept) Serial.println("crept in, close enough to read");
+        else { Serial.print("wall already "); printMm(dist[AHEAD]); Serial.println(" away, no need to creep"); }
+      } else {
+        if (!crept) { event("CHECK_RIGHT"); Serial.print("wall "); printMm(dist[AHEAD]); Serial.println(" away, too far to read, creeping in"); }
+        crept = true;
+        driveStraight();
+      }
+      break;
+
     case AT_WAYPOINT:
       stopMotors();
       if (elapsed >= (unsigned long)hold_ms) leaveWaypoint();
@@ -240,34 +277,66 @@ void loop() {
 }
 
 
-// LOCALIZATION LOGIC: name the wall ahead from the colours at two corners in a row
+// LOCALIZATION LOGIC: name the walls from the colours of two neighbouring walls
 void handleCorner(Colour c) {
   event("CORNER"); Serial.print("wall ahead is "); Serial.print(c == WHITE ? "WHITE" : "BLACK");
   if (stopped_by_ir) Serial.println(", stopped by the IR sensors");
   else { Serial.print(", stopped by the ahead sensor at "); printMm(dist[AHEAD]); Serial.println(); }
 
-  int from_colours = (last_colour >= 0) ? wallFromColours((Colour)last_colour, c) : -1;
-  last_colour = c;
-
-  if (localized) {
+  if (!colour_sure) {
+    // one sensor on white, one on black: probably facing a corner at an angle
+    event("CORNER"); Serial.println("the IR sensors disagree, not using this colour");
+    if (localized) ahead_wall = (ahead_wall + 1) % 4;   // still one wall on, just unchecked
+    else { setState(TURN_LEFT); return; }
+  } else if (localized) {
     ahead_wall = (ahead_wall + 1) % 4;   // one left turn = one wall on, counter-clockwise
-    if (WALL_COLOUR[ahead_wall] != c) {
+    if (WALL_COLOUR[ahead_wall] != c && last_colour >= 0) {
       event("MISMATCH"); Serial.print("expected the "); Serial.print(WALL_NAME[ahead_wall]);
       Serial.println(" wall but the colour is wrong, trusting the last two colours instead");
-      ahead_wall = from_colours;
+      ahead_wall = wallFromColours((Colour)last_colour, c);
     }
-  } else if (from_colours >= 0) {
-    ahead_wall = from_colours;
+  } else if (last_colour >= 0) {
+    ahead_wall = wallFromColours((Colour)last_colour, c);
     localized = true;
     event("LOCALIZED"); Serial.print("at the "); Serial.print(CORNER_NAME[ahead_wall]);
     Serial.print(" corner, facing the "); Serial.print(WALL_NAME[ahead_wall]); Serial.println(" wall");
   } else {
-    event("CORNER"); Serial.println("one colour isn't enough, need the next corner too");
+    // one colour isn't enough: read the clockwise neighbour too
+    last_colour = c;
+    event("CORNER"); Serial.println("one colour isn't enough, turning right to read the next wall");
+    setState(TURN_RIGHT);
+    return;
+  }
+  if (colour_sure) last_colour = c;
+
+  setPoseAtCorner();
+  stopAtCornerWaypoint();
+}
+
+// after the right turn: this wall comes just before the first one, counter-clockwise
+void handleRightCheck(Colour c) {
+  event("CHECK_RIGHT"); Serial.print("this wall is "); Serial.println(c == WHITE ? "WHITE" : "BLACK");
+  turn_around = true;   // turn left 180 so the first wall ends up on the right
+
+  if (!colour_sure) {
+    event("CHECK_RIGHT"); Serial.println("the IR sensors disagree, will localize at the next corner instead");
     setState(TURN_LEFT);
     return;
   }
 
+  // either way we're now at the corner where this wall meets the first one
+  ahead_wall = wallFromColours(c, (Colour)last_colour);   // the first wall
+  localized = true;
+  event("LOCALIZED"); Serial.print("at the "); Serial.print(CORNER_NAME[ahead_wall]);
+  Serial.print(" corner, the first wall was the "); Serial.print(WALL_NAME[ahead_wall]); Serial.println(" wall");
+
   setPoseAtCorner();
+  pose_th = FACING_DEG[(ahead_wall + 3) % 4];   // actually facing the wall we just read
+  stopAtCornerWaypoint();
+}
+
+// BR and TR are ring corners: stop there if we haven't yet, otherwise turn onto the next wall
+void stopAtCornerWaypoint() {
   int wp = (ahead_wall == W_RIGHT) ? WP_BR : (ahead_wall == W_TOP) ? WP_TR : -1;
   if (MODE == 4 && wp >= 0 && !visited[wp]) arriveAt(wp);
   else setState(TURN_LEFT);
@@ -282,8 +351,10 @@ int wallFromColours(Colour before, Colour ahead) {
 
 // after turning at a corner, the wall we faced is now on the right
 void afterLeftTurn() {
+  bool was_around = turn_around;
+  turn_around = false;
   if (!localized) return;
-  pose_th += 90;
+  pose_th += was_around ? 180 : 90;
   if (pose_th > 180) pose_th -= 360;
   event("TURN_LEFT"); Serial.print("done, now on the "); Serial.print(WALL_NAME[ahead_wall]); Serial.println(" wall");
   if (MODE == 4 && ahead_wall == W_LEFT && !visited[WP_L]) {
@@ -373,9 +444,11 @@ float wallController() {
 
 // turn ends use raw readings, the median lags while spinning
 // theta is negative mid-spin (nose into the new wall) and rises toward 0
+// a 180 turn gets twice the time. half way round the ahead sensor sees a wall, so it can't end there
 bool leftTurnDone(unsigned long elapsed) {
-  if (elapsed >= (unsigned long)turn_max_ms) return true;
-  if (elapsed < (unsigned long)turn_min_ms) return false;
+  unsigned long scale = turn_around ? 2 : 1;
+  if (elapsed >= scale * turn_max_ms) return true;
+  if (elapsed < scale * turn_min_ms) return false;
   if (!sidesSeeWall(raw)) return false;
   float th, d;
   estimate(raw, th, d);
@@ -447,7 +520,8 @@ bool irSeesWhite() {
   return ir_white_since != 0 && millis() - ir_white_since >= 20;
 }
 
-// stopped at a corner: 20 reads from each sensor, majority of all 40 decides
+// stopped at a wall: 20 reads from each sensor, majority of all 40 decides.
+// colour_sure only if both sensors clearly say the same thing
 Colour readColour() {
   int right_white = 0, left_white = 0;
   for (int i = 0; i < 20; i++) {
@@ -455,8 +529,12 @@ Colour readColour() {
     if (digitalRead(IR_LEFT) == IR_WHITE) left_white++;
     delay(2);
   }
+  bool both_white = right_white >= SURE_READS && left_white >= SURE_READS;
+  bool both_black = right_white <= 20 - SURE_READS && left_white <= 20 - SURE_READS;
+  colour_sure = both_white || both_black;
   event("IR"); Serial.print("white reads: right "); Serial.print(right_white);
-  Serial.print("/20, left "); Serial.print(left_white); Serial.println("/20");
+  Serial.print("/20, left "); Serial.print(left_white);
+  Serial.println(colour_sure ? "/20, sensors agree" : "/20, sensors DISAGREE");
   return (right_white + left_white > 20) ? WHITE : BLACK;
 }
 
@@ -490,6 +568,10 @@ void spinLeft(int pwm) {
   setWheels(0, pwm, pwm, 0);
 }
 
+void spinRight(int pwm) {
+  setWheels(pwm, 0, 0, pwm);
+}
+
 void stopMotors() {
   setWheels(0, 0, 0, 0);
 }
@@ -501,6 +583,8 @@ void setState(State s) {
   state_start_ms = millis();
   ahead_close_count = 0;
   overturn_start_ms = 0;
+  settle_ms = 0;
+  crept = false;
   if (s == FOLLOW_WALL) last_ctrl_ms = millis();   // no huge dt after a turn
   stamp();
   Serial.print("-> "); Serial.print(stateName(s));
@@ -511,6 +595,8 @@ const char* stateName(State s) {
   switch (s) {
     case FOLLOW_WALL: return "FOLLOW_WALL";
     case CORNER:      return "CORNER";
+    case TURN_RIGHT:  return "TURN_RIGHT";
+    case CHECK_RIGHT: return "CHECK_RIGHT";
     case AT_WAYPOINT: return "AT_WAYPOINT";
     case TURN_LEFT:   return "TURN_LEFT";
     case LEFT_EXIT:   return "LEFT_EXIT";
@@ -524,8 +610,11 @@ const char* stateAction(State s) {
   switch (s) {
     case FOLLOW_WALL: return "following the wall on the right (straight ahead if there isn't one)";
     case CORNER:      return "stopped at a wall, reading its colour";
+    case TURN_RIGHT:  return "turning right to face the next wall clockwise";
+    case CHECK_RIGHT: return "checking the distance, creeping in only if too far to read";
     case AT_WAYPOINT: return "stopped on a waypoint for 3 s";
-    case TURN_LEFT:   return "turning left so the wall ahead is on the right";
+    case TURN_LEFT:   return turn_around ? "turning left 180 so the first wall is on the right"
+                                         : "turning left so the wall ahead is on the right";
     case LEFT_EXIT:   return "pulling away from the corner";
     case DONE:        return "finished, motors off";
   }
@@ -625,7 +714,7 @@ void printSettings() {
   Serial.print(" u="); Serial.print(turn_pwm);  Serial.print(" n="); Serial.print(turn_min_ms);
   Serial.print(" t="); Serial.print(turn_max_ms); Serial.print(" e="); Serial.print(ahead_clear_mm);
   Serial.print(" o="); Serial.print(overturn_ms); Serial.print(" d="); Serial.print(left_done_deg);
-  Serial.print(" b="); Serial.print(exit_straight_ms);
+  Serial.print(" b="); Serial.print(exit_straight_ms); Serial.print(" r="); Serial.print(right_turn_ms);
   Serial.print(" z="); Serial.print(hold_ms);   Serial.print(" l="); Serial.print(l_time_ms);
   Serial.print(" y="); Serial.print(mm_per_s);  Serial.print(" c="); Serial.print(side_off_mm);
   Serial.print(" k="); Serial.print(kick_ms);   Serial.print(" q="); Serial.println(use_median);
@@ -667,13 +756,14 @@ void applyCommand(char c, float v) {
     case 'o': overturn_ms = max((int)v, 0); break;
     case 'd': left_done_deg = (int)v; break;
     case 'b': exit_straight_ms = (int)v; break;
+    case 'r': right_turn_ms = (int)v; break;
     case 'z': hold_ms = (int)v; break;
     case 'l': l_time_ms = (int)v; break;
     case 'y': mm_per_s = v; break;
     case 'c': side_off_mm = v; break;
     case 'k': kick_ms = max((int)v, 0); break;
     case 'q': use_median = (int)v; break;
-    default: Serial.println("unknown, use w p h i a s x m f u n t e o d b z l y c k q g"); return;
+    default: Serial.println("unknown, use w p h i a s x m f u n t e o d b r z l y c k q g"); return;
   }
   integral_L = 0;   // restart the integral after any change
   printSettings();
