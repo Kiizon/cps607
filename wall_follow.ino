@@ -8,7 +8,8 @@
 // sensors (white reflects IR, black doesn't). counter-clockwise the walls go W B B W, so the
 // colours of two neighbouring walls name them: (W,B) bottom then right, (B,B) right then top,
 // (B,W) top then left, (W,W) left then bottom.
-// after the first stop it only has one colour, so it turns right to face the clockwise
+// after the first stop it only has one colour. if a wall is close and parallel on its right
+// it is in a corner, so it turns right to face that clockwise
 // neighbour, creeps in if that wall is too far to read, and reads it too. then it turns
 // left 180 so the first wall is on its right, and follows it.
 //
@@ -17,7 +18,8 @@
 // the top-left turn.
 //
 // FOLLOW_WALL -> black wall close on the ahead sensor, or IR sees white -> CORNER (read colour)
-// CORNER      -> first colour -> TURN_RIGHT -> CHECK_RIGHT (creep if needed, read) -> TURN_LEFT 180
+// CORNER      -> first colour, wall close on the right -> TURN_RIGHT -> CHECK_RIGHT (creep if needed, read) -> TURN_LEFT 180
+// CORNER      -> first colour, no wall on the right -> TURN_LEFT, localize at the next corner
 // CORNER      -> at BR or TR, not visited yet -> AT_WAYPOINT -> TURN_LEFT
 // CORNER      -> anywhere else                -> TURN_LEFT -> LEFT_EXIT -> FOLLOW_WALL
 // FOLLOW_WALL -> l_time_ms after the top-left turn -> AT_WAYPOINT -> FOLLOW_WALL
@@ -85,7 +87,9 @@ int ahead_clear_mm = 350;      // e  TURN_LEFT can't end until ahead is clear pa
 int overturn_ms = 0;           // o  extra spin after parallel (0 = off)
 int left_done_deg = 5;         // d  TURN_LEFT ends within this many degrees of parallel
 int exit_straight_ms = 150;    // b  LEFT_EXIT straight time
-int right_turn_ms = 450;       // r  time for a 90 deg right turn at turn_pwm, tune
+int right_turn_ms = 650;       // r  time for a 90 deg right turn at turn_pwm, tune
+float right_wall_mm = 250;     // j  right wall closer than this at the first stop = in a corner
+float right_wall_deg = 10;     // v  and the robot is within this many deg of parallel to it
 int hold_ms = 3200;            // z  stop at each waypoint (3 s required + margin)
 int l_time_ms = 2500;          // l  drive time from the top-left turn to waypoint L (500 mm), tune
 float mm_per_s = 200;          // y  forward speed at `base`, for the pose estimate, tune
@@ -159,7 +163,7 @@ void setup() {
   const char* const MODE_NAME[5] = {"sensors only, motors off", "drive straight", "follow the wall",
     "follow, turn at corners and localize", "full run: localize, then visit BR, TR, L"};
   Serial.print("MODE "); Serial.print(MODE); Serial.print(": "); Serial.println(MODE_NAME[MODE]);
-  Serial.println("tune: w p h i a s x m f u n t e o d b r z l y c k q, g prints all");
+  Serial.println("tune: w p h i a s x m f u n t e o d b r j v z l y c k q, g prints all");
   if (MODE >= 1) {
     Serial.println("starting in 3 s, put the robot down");
     delay(3000);
@@ -301,16 +305,31 @@ void handleCorner(Colour c) {
     event("LOCALIZED"); Serial.print("at the "); Serial.print(CORNER_NAME[ahead_wall]);
     Serial.print(" corner, facing the "); Serial.print(WALL_NAME[ahead_wall]); Serial.println(" wall");
   } else {
-    // one colour isn't enough: read the clockwise neighbour too
+    // one colour isn't enough. a close, parallel wall on the right means we're in a corner,
+    // so read that wall too. otherwise we're mid-wall: turn left and localize at the next corner
     last_colour = c;
-    event("CORNER"); Serial.println("one colour isn't enough, turning right to read the next wall");
-    setState(TURN_RIGHT);
+    if (rightWallClose()) {
+      event("CORNER"); Serial.println("one colour isn't enough, wall close on the right, turning right to read it");
+      setState(TURN_RIGHT);
+    } else {
+      event("CORNER"); Serial.println("one colour isn't enough, no wall close on the right, will read the next corner");
+      setState(TURN_LEFT);
+    }
     return;
   }
   if (colour_sure) last_colour = c;
 
   setPoseAtCorner();
   stopAtCornerWaypoint();
+}
+
+// in a corner: both right sensors see a wall, it's close, and we're roughly parallel to it
+bool rightWallClose() {
+  float th = 0, d = NO_ECHO;
+  if (sidesSeeWall(dist)) estimate(dist, th, d);
+  event("CORNER"); Serial.print("right wall "); printMm(d);
+  Serial.print(", angle "); Serial.print(th, 0); Serial.println(" deg");
+  return d < right_wall_mm && fabs(th) < right_wall_deg;
 }
 
 // after the right turn: this wall comes just before the first one, counter-clockwise
@@ -715,6 +734,7 @@ void printSettings() {
   Serial.print(" t="); Serial.print(turn_max_ms); Serial.print(" e="); Serial.print(ahead_clear_mm);
   Serial.print(" o="); Serial.print(overturn_ms); Serial.print(" d="); Serial.print(left_done_deg);
   Serial.print(" b="); Serial.print(exit_straight_ms); Serial.print(" r="); Serial.print(right_turn_ms);
+  Serial.print(" j="); Serial.print(right_wall_mm, 0); Serial.print(" v="); Serial.print(right_wall_deg, 0);
   Serial.print(" z="); Serial.print(hold_ms);   Serial.print(" l="); Serial.print(l_time_ms);
   Serial.print(" y="); Serial.print(mm_per_s);  Serial.print(" c="); Serial.print(side_off_mm);
   Serial.print(" k="); Serial.print(kick_ms);   Serial.print(" q="); Serial.println(use_median);
@@ -757,13 +777,15 @@ void applyCommand(char c, float v) {
     case 'd': left_done_deg = (int)v; break;
     case 'b': exit_straight_ms = (int)v; break;
     case 'r': right_turn_ms = (int)v; break;
+    case 'j': right_wall_mm = v; break;
+    case 'v': right_wall_deg = v; break;
     case 'z': hold_ms = (int)v; break;
     case 'l': l_time_ms = (int)v; break;
     case 'y': mm_per_s = v; break;
     case 'c': side_off_mm = v; break;
     case 'k': kick_ms = max((int)v, 0); break;
     case 'q': use_median = (int)v; break;
-    default: Serial.println("unknown, use w p h i a s x m f u n t e o d b r z l y c k q g"); return;
+    default: Serial.println("unknown, use w p h i a s x m f u n t e o d b r j v z l y c k q g"); return;
   }
   integral_L = 0;   // restart the integral after any change
   printSettings();
