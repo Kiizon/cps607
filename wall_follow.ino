@@ -79,7 +79,7 @@ float max_approach_deg = 15;   // a  steepest angle the distance term may ask fo
 int base = 120;                // s  forward pwm
 int max_steer = 30;            // x
 int left_trim = 7;             // m  taken off the left wheel to drive straight
-int front_stop_mm = 170;       // f  ahead sensor stop for black walls. keep it under the IR range so white walls stop on the IR
+int front_stop_mm = 230;       // f  ahead sensor stop for black walls. keep it under the IR range so white walls stop on the IR
 int turn_pwm = 150;            // u
 int turn_min_ms = 250;         // n
 int turn_max_ms = 700;         // t
@@ -87,11 +87,11 @@ int ahead_clear_mm = 350;      // e  TURN_LEFT can't end until ahead is clear pa
 int overturn_ms = 0;           // o  extra spin after parallel (0 = off)
 int left_done_deg = 5;         // d  TURN_LEFT ends within this many degrees of parallel
 int exit_straight_ms = 150;    // b  LEFT_EXIT straight time
-int right_turn_ms = 650;       // r  time for a 90 deg right turn at turn_pwm, tune
+int right_turn_ms = 600;       // r  time for a 90 deg right turn at turn_pwm, tune
 float right_wall_mm = 250;     // j  right wall closer than this at the first stop = in a corner
 float right_wall_deg = 10;     // v  and the robot is within this many deg of parallel to it
-int hold_ms = 3200;            // z  stop at each waypoint (3 s required + margin)
-int l_time_ms = 2500;          // l  drive time from the top-left turn to waypoint L (500 mm), tune
+int hold_ms = 5000;            // z  stop at each waypoint (3 s required + margin)
+int l_time_ms = 2700;          // l  drive time from the top-left turn to waypoint L (500 mm), tune
 float mm_per_s = 200;          // y  forward speed at `base`, for the pose estimate, tune
 float side_off_mm = 60;        // c  robot centre to the side sensor faces, measure
 int kick_ms = 40;              // k  full-power burst when a stopped motor starts, 0 = off
